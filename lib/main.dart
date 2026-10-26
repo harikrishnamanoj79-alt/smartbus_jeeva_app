@@ -6,6 +6,7 @@ import 'screens/home_screen.dart';
 import 'screens/login_screen.dart';
 import 'services/api_service.dart';
 import 'services/auth_service.dart';
+import 'services/emergency_service.dart';
 import 'services/journey_service.dart';
 import 'services/theme_service.dart';
 import 'services/background_tracking_service.dart';
@@ -45,6 +46,26 @@ class _SmartBusGuardianState extends State<SmartBusGuardian> {
     if (AuthService.instance.sessionExpiredNotifier.value) {
       AuthService.instance.sessionExpiredNotifier.value = false;
       final navContext = appNavigatorKey.currentContext;
+
+      final isSosActive = EmergencyService.instance.isSosTriggered;
+      final isJourneyActive = JourneyService.instance.activeJourneyNotifier.value != null;
+
+      if (isSosActive || isJourneyActive) {
+        // Never pull the user out mid-emergency or mid-journey!
+        // Defer re-login and show a non-blocking notification banner.
+        if (navContext != null) {
+          ScaffoldMessenger.maybeOf(navContext)?.showSnackBar(
+            const SnackBar(
+              content: Text('Session expired. Emergency & offline mode active.'),
+              backgroundColor: Colors.orange,
+              duration: Duration(seconds: 4),
+            ),
+          );
+        }
+        AuthService.instance.pendingReLogin = true;
+        return;
+      }
+
       if (navContext != null) {
         ScaffoldMessenger.maybeOf(navContext)?.showSnackBar(
           const SnackBar(

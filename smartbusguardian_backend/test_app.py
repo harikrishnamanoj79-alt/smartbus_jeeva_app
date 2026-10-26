@@ -10,9 +10,12 @@ class BackendApiTest(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.database_path = Path(self.temporary_directory.name) / "test.db"
-        with sqlite3.connect(self.database_path) as connection:
+        connection = sqlite3.connect(self.database_path)
+        try:
             schema_path = Path(__file__).with_name("schema.sql")
             connection.executescript(schema_path.read_text(encoding="utf-8"))
+        finally:
+            connection.close()
 
         self.original_database_path = backend.DB_PATH
         backend.DB_PATH = str(self.database_path)
@@ -68,11 +71,14 @@ class BackendApiTest(unittest.TestCase):
         self.assertIn("access_token", registration.json)
         user_id = registration.json["user_id"]
 
-        with sqlite3.connect(self.database_path) as connection:
+        connection = sqlite3.connect(self.database_path)
+        try:
             stored_password = connection.execute(
                 "SELECT password_hash FROM tbl_users WHERE user_id = ?",
                 (user_id,),
             ).fetchone()[0]
+        finally:
+            connection.close()
         self.assertNotEqual(stored_password, "test123")
 
         login = self.client.post(
@@ -314,6 +320,85 @@ class BackendApiTest(unittest.TestCase):
         self.assertNotIn("smartbus-guardian-production-secret", secret)
         self.assertNotIn("super-secret-smartbus", secret)
         self.assertGreaterEqual(len(secret), 32)
+
+    def test_login_rate_limiting_only_counts_failures(self):
+        self.create_user("ratelimit@example.test", "9888877771")
+
+        # 6 successful logins in a row must NOT be rate limited
+        for _ in range(6):
+            res = self.client.post(
+                "/api/login",
+                json={"identifier": "ratelimit@example.test", "password": "test123"},
+            )
+            self.assertEqual(res.status_code, 200)
+
+        # 5 failed logins will trigger 429 on the 6th
+        for _ in range(5):
+            res = self.client.post(
+                "/api/login",
+                json={"identifier": "ratelimit@example.test", "password": "wrongpassword"},
+            )
+            self.assertEqual(res.status_code, 401)
+
+        # 6th attempt must return 429
+        locked_out = self.client.post(
+            "/api/login",
+            json={"identifier": "ratelimit@example.test", "password": "wrongpassword"},
+        )
+        self.assertEqual(locked_out.status_code, 429)
+
+    def test_unauthorized_token_flow(self):
+        # Missing token
+        res_no_token = self.client.get("/api/journey/history/1")
+        self.assertEqual(res_no_token.status_code, 401)
+
+        # Invalid token
+        res_bad_token = self.client.get(
+            "/api/journey/history/1",
+            headers={"Authorization": "Bearer invalid.token.value"},
+        )
+        self.assertEqual(res_bad_token.status_code, 401)
+
+    def test_sms_relay_partial_failure_reporting(self):
+        from unittest.mock import patch, MagicMock
+
+        user_id, token = self.create_user("partialsms@example.test", "9888877772")
+        self.client.post(
+            "/api/contacts",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"contact_name": "Contact 1", "contact_phone": "9998887771"},
+        )
+        self.client.post(
+            "/api/contacts",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"contact_name": "Contact 2", "contact_phone": "9998887772"},
+        )
+
+        with patch.dict("os.environ", {
+            "TWILIO_ACCOUNT_SID": "AC1234567890",
+            "TWILIO_AUTH_TOKEN": "mock_token",
+            "TWILIO_FROM_NUMBER": "+1234567890",
+        }):
+            mock_client = MagicMock()
+            # 1st send succeeds, 2nd send throws exception
+            mock_client.messages.create.side_effect = [
+                MagicMock(sid="SM1"),
+                Exception("Twilio destination unreachable"),
+            ]
+
+            with patch("twilio.rest.Client", return_value=mock_client):
+                res = self.client.post(
+                    "/api/sms/send",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"message": "Emergency Alert"},
+                )
+                self.assertEqual(res.status_code, 200)
+                self.assertTrue(res.json["success"])
+                self.assertTrue(res.json["partial"])
+                self.assertEqual(res.json["fallback"], "device_for_failed")
+                self.assertEqual(res.json["sent_to"], 1)
+                self.assertEqual(len(res.json["failed_numbers"]), 1)
+                self.assertEqual(len(res.json["sent_numbers"]), 1)
 
 
 if __name__ == "__main__":

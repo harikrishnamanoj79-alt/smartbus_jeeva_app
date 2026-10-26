@@ -11,6 +11,7 @@ import '../models/emergency_contact.dart';
 import '../models/sos_record.dart';
 import 'alert_service.dart';
 import 'api_service.dart';
+import 'auth_service.dart';
 
 Uri buildSosSmsUri(
   List<String> phoneNumbers,
@@ -47,6 +48,18 @@ bool isEmergencyHelplinePhoneNumber(String phoneNumber) {
         helplineNumbers.contains(digits.substring(4))) {
       return true;
     }
+  }
+  return false;
+}
+
+bool matchesPhoneNumber(String phoneA, String phoneB) {
+  final a = phoneA.replaceAll(RegExp(r'\D'), '');
+  final b = phoneB.replaceAll(RegExp(r'\D'), '');
+  if (a.isEmpty || b.isEmpty) return false;
+  if (a == b) return true;
+  // Require at least 7 digits to prevent accidental short matches
+  if (a.length >= 7 && b.length >= 7) {
+    return a.endsWith(b) || b.endsWith(a);
   }
   return false;
 }
@@ -440,35 +453,36 @@ class EmergencyService {
         message: message,
       );
 
-      final failedRaw = result['failed_numbers'] as List<dynamic>? ?? [];
-      final failedSet = failedRaw
-          .map((e) => e.toString().replaceAll(RegExp(r'\D'), ''))
-          .toSet();
+      final sentRaw = result['sent_numbers'] as List<dynamic>? ?? [];
+      final sentNumbers = sentRaw.map((e) => e.toString()).toList();
 
-      List<EmergencyContact> failedContacts;
-      if (failedSet.isNotEmpty) {
-        failedContacts = eligibleContacts.where((c) {
-          final digits = c.phone.replaceAll(RegExp(r'\D'), '');
-          return failedSet.contains(digits) ||
-              failedSet.any((f) => digits.endsWith(f) || f.endsWith(digits));
-        }).toList();
-      } else if (result['success'] != true) {
-        failedContacts = eligibleContacts;
+      final List<EmergencyContact> successfullySent = [];
+      final List<EmergencyContact> uncoveredContacts = [];
+
+      if (result['success'] == true) {
+        for (final contact in eligibleContacts) {
+          final wasSent = sentNumbers.any(
+            (s) => matchesPhoneNumber(s, contact.phone),
+          );
+          if (wasSent) {
+            successfullySent.add(contact);
+          } else {
+            uncoveredContacts.add(contact);
+          }
+        }
       } else {
-        failedContacts = [];
+        // Entire backend relay failed or was unconfigured
+        uncoveredContacts.addAll(eligibleContacts);
       }
 
-      final int sentTo = result['sent_to'] as int? ??
-          (result['success'] == true
-              ? eligibleContacts.length - failedContacts.length
-              : 0);
+      final isPartial = successfullySent.isNotEmpty && uncoveredContacts.isNotEmpty;
 
       return {
         'success': result['success'] == true,
-        'partial': result['partial'] == true,
+        'partial': isPartial,
         'backend': result['backend'],
-        'sent_to': sentTo,
-        'failed_contacts': failedContacts,
+        'sent_to': successfullySent.length,
+        'failed_contacts': uncoveredContacts,
         'message': result['message'] ?? result['error'],
       };
     } catch (error) {
@@ -697,5 +711,6 @@ class EmergencyService {
     _isSosTriggered = false;
     sosActiveNotifier.value = false;
     _activeSosRecord = null;
+    AuthService.instance.checkPendingReLogin();
   }
 }

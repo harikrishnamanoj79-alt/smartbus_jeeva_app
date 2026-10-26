@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/journey_record.dart';
 import 'api_service.dart';
+import 'auth_service.dart';
 
 class JourneyService {
   JourneyService._();
@@ -127,6 +128,8 @@ class JourneyService {
     // Remove active journey
     await prefs.remove(_activeJourneyKey);
     activeJourneyNotifier.value = null;
+
+    AuthService.instance.checkPendingReLogin();
 
     return finishedJourney;
   }

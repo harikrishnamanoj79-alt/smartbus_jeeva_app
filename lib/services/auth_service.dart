@@ -18,6 +18,14 @@ class AuthService {
   static final AuthService instance = AuthService._();
 
   final ValueNotifier<bool> sessionExpiredNotifier = ValueNotifier<bool>(false);
+  bool pendingReLogin = false;
+
+  void checkPendingReLogin() {
+    if (pendingReLogin) {
+      pendingReLogin = false;
+      sessionExpiredNotifier.value = true;
+    }
+  }
 
   static const _storageKey = 'smartbus_registered_users_v2';
   static const _sessionKey = 'smartbus_current_user_session_v2';
@@ -245,7 +253,51 @@ class AuthService {
       return 'Email/phone and password do not match';
     }
 
-    if (matchedUser == null) {
+    if (matchedUser != null) {
+      // User verified locally. Now fetch a fresh JWT token from backend.
+      try {
+        final emailToUse = (matchedUser['email'] ?? identifier).toString();
+        final apiResult = await ApiService.loginUser(
+          email: emailToUse,
+          password: normalizedPassword,
+        );
+        if (apiResult['success'] == true) {
+          if (apiResult['access_token'] != null) {
+            await _saveJwt(apiResult['access_token'].toString());
+          }
+          if (apiResult['user'] is Map) {
+            final backendUser = Map<String, dynamic>.from(apiResult['user'] as Map);
+            matchedUser['id'] = backendUser['user_id'] ?? backendUser['id'] ?? matchedUser['id'];
+            matchedUser['backend_synced'] = true;
+          }
+        } else if (matchedUser['backend_synced'] != true) {
+          // If offline user is not on backend yet, sync registration
+          final regResult = await ApiService.registerUser(
+            fullName: matchedUser['name'] ?? matchedUser['username'] ?? 'Passenger',
+            email: emailToUse,
+            phoneNumber: (matchedUser['phone'] ?? '').toString(),
+            password: normalizedPassword,
+          );
+          if (regResult['success'] == true) {
+            if (regResult['access_token'] != null) {
+              await _saveJwt(regResult['access_token'].toString());
+            }
+            if (regResult['user_id'] != null) {
+              matchedUser['id'] = regResult['user_id'];
+              matchedUser['backend_synced'] = true;
+            }
+          }
+        }
+      } catch (error) {
+        debugPrint('Backend sync / token fetch during login: $error');
+      }
+
+      if (!matchedUser.containsKey('password_hash')) {
+        matchedUser.remove('password');
+        matchedUser.addAll(_passwordFields(normalizedPassword));
+        users[matchedEmail!] = matchedUser;
+      }
+    } else {
       final apiResult = await ApiService.loginUser(
         email: identifier.trim(),
         password: normalizedPassword,
@@ -270,10 +322,6 @@ class AuthService {
         matchedEmail = matchedUser['email']?.toString();
         if (matchedEmail != null) users[matchedEmail] = matchedUser;
       }
-    } else if (!matchedUser.containsKey('password_hash')) {
-      matchedUser.remove('password');
-      matchedUser.addAll(_passwordFields(normalizedPassword));
-      users[matchedEmail!] = matchedUser;
     }
 
     if (matchedUser == null) {

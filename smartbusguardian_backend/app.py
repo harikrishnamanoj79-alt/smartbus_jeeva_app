@@ -27,7 +27,7 @@ app = Flask(__name__)
 def get_jwt_secret():
     """
     Returns JWT secret from environment or generates a secure random
-    secret persisted in .jwt_secret.
+    secret persisted in .jwt_secret with atomic creation and restricted permissions.
     """
     env_secret = os.environ.get("JWT_SECRET_KEY")
     if env_secret and env_secret.strip():
@@ -48,8 +48,16 @@ def get_jwt_secret():
 
     new_secret = secrets.token_hex(32)
     try:
-        with open(secret_file, "w", encoding="utf-8") as f:
-            f.write(new_secret)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        mode = 0o600
+        try:
+            fd = os.open(secret_file, flags, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(new_secret)
+            return new_secret
+        except FileExistsError:
+            with open(secret_file, "r", encoding="utf-8") as f:
+                return f.read().strip() or new_secret
     except OSError:
         pass
     return new_secret
@@ -58,6 +66,21 @@ app.config["JWT_SECRET_KEY"] = get_jwt_secret()
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = datetime.timedelta(days=30)
 jwt = JWTManager(app)
 
+
+@jwt.unauthorized_loader
+def unauthorized_callback(callback):
+    return jsonify({"error": "Missing or unauthorized authorization token", "message": str(callback)}), 401
+
+
+@jwt.invalid_token_loader
+def invalid_token_callback(callback):
+    return jsonify({"error": "Invalid authorization token", "message": str(callback)}), 401
+
+
+@jwt.expired_token_loader
+def expired_token_callback(jwt_header, jwt_payload):
+    return jsonify({"error": "Authorization token has expired"}), 401
+
 # Thread-safe in-memory sliding-window rate limit trackers
 _RATE_LIMIT_LOCK = threading.Lock()
 _LAST_PRUNE_TIME = time.time()
@@ -65,18 +88,27 @@ LOGIN_ATTEMPTS = {}  # key -> list of timestamp floats
 SMS_ATTEMPTS = {}    # user_id -> list of timestamp floats
 
 HELPLINE_NUMBERS = {"112", "100", "108", "1091", "911", "999", "000"}
+DEFAULT_COUNTRY_CODE = os.environ.get("DEFAULT_COUNTRY_CODE", "+91")
 
 
-def check_rate_limit(tracker_dict, key, max_attempts=5, window_seconds=300):
+def get_client_ip():
     """
-    Thread-safe sliding-window rate limit checker with automatic memory pruning.
-    Returns True if allowed, False if rate limit exceeded.
+    Extracts the client IP address, respecting X-Forwarded-For if behind a reverse proxy.
+    """
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.remote_addr or "client"
+
+
+def is_rate_limited(tracker_dict, key, max_attempts=5, window_seconds=300):
+    """
+    Checks if a key has exceeded max attempts within the given window without recording an attempt.
     """
     global _LAST_PRUNE_TIME
     now = time.time()
 
     with _RATE_LIMIT_LOCK:
-        # Periodic pruning every 60 seconds to prevent unbounded memory growth
         if now - _LAST_PRUNE_TIME > 60:
             _LAST_PRUNE_TIME = now
             for tracker in (LOGIN_ATTEMPTS, SMS_ATTEMPTS):
@@ -91,33 +123,60 @@ def check_rate_limit(tracker_dict, key, max_attempts=5, window_seconds=300):
                     tracker.pop(k, None)
 
         attempts = tracker_dict.get(key, [])
-        # Prune expired timestamps for current key
-        attempts = [t for t in attempts if now - t < window_seconds]
-        if len(attempts) >= max_attempts:
-            tracker_dict[key] = attempts
-            return False
-        attempts.append(now)
-        tracker_dict[key] = attempts
-        return True
+        valid_attempts = [t for t in attempts if now - t < window_seconds]
+        tracker_dict[key] = valid_attempts
+        return len(valid_attempts) >= max_attempts
 
 
-def normalize_phone_number(raw_phone):
+def record_rate_limit_attempt(tracker_dict, key):
     """
-    Normalizes a phone number into an E.164-compatible digit string.
+    Records an event timestamp (e.g. on failed authentication).
+    """
+    with _RATE_LIMIT_LOCK:
+        attempts = tracker_dict.get(key, [])
+        attempts.append(time.time())
+        tracker_dict[key] = attempts
+
+
+def clear_rate_limit(tracker_dict, key):
+    """
+    Resets the rate limit tracking for a key upon successful action.
+    """
+    with _RATE_LIMIT_LOCK:
+        tracker_dict.pop(key, None)
+
+
+def check_rate_limit(tracker_dict, key, max_attempts=5, window_seconds=300):
+    """
+    Convenience method that checks and records an attempt (used for SMS sending).
+    """
+    if is_rate_limited(tracker_dict, key, max_attempts=max_attempts, window_seconds=window_seconds):
+        return False
+    record_rate_limit_attempt(tracker_dict, key)
+    return True
+
+
+def normalize_phone_number(raw_phone, default_country_code=DEFAULT_COUNTRY_CODE):
+    """
+    Normalizes a phone number into an E.164-compatible string.
+    Preserves existing international prefixes.
     """
     if not isinstance(raw_phone, str):
         return None
     raw = raw_phone.strip()
+    if not raw:
+        return None
     digits = "".join(ch for ch in raw if ch.isdigit())
     if not digits:
         return None
     if raw.startswith("+"):
         return f"+{digits}"
-    if len(digits) == 10:
-        return f"+91{digits}"
-    if len(digits) == 12 and digits.startswith("91"):
-        return f"+{digits}"
-    return f"+{digits}"
+    if raw.startswith("00"):
+        return f"+{digits[2:]}"
+    if len(digits) == 10 and default_country_code:
+        prefix = default_country_code if default_country_code.startswith("+") else f"+{default_country_code}"
+        return f"{prefix}{digits}"
+    return f"+{digits}" if len(digits) > 10 else digits
 
 
 def is_emergency_helpline_number(phone_str):
@@ -286,9 +345,9 @@ def login_user():
     if not password:
         return jsonify({"error": "Password is required"}), 400
 
-    client_ip = request.remote_addr or "client"
+    client_ip = get_client_ip()
     rate_key = f"{client_ip}:{identifier.lower()}"
-    if not check_rate_limit(LOGIN_ATTEMPTS, rate_key, max_attempts=5, window_seconds=300):
+    if is_rate_limited(LOGIN_ATTEMPTS, rate_key, max_attempts=5, window_seconds=300):
         return jsonify({
             "success": False,
             "error": "Too many failed login attempts. Please wait 5 minutes before trying again."
@@ -313,7 +372,7 @@ def login_user():
             password_matches = False
 
     if row and password_matches:
-        LOGIN_ATTEMPTS.pop(rate_key, None)
+        clear_rate_limit(LOGIN_ATTEMPTS, rate_key)
         user_id = row["user_id"]
         access_token = create_access_token(identity=str(user_id))
 
@@ -330,6 +389,8 @@ def login_user():
             }
         }), 200
 
+    # Only record attempt on authentication failure!
+    record_rate_limit_attempt(LOGIN_ATTEMPTS, rate_key)
     return jsonify({
         "success": False,
         "error": "Invalid email/phone number or password"

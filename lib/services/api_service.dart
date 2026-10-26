@@ -27,15 +27,25 @@ class ApiService {
     _jwtToken = token;
   }
 
-  static void _checkResponse(http.Response response) {
-    if (response.statusCode == 401) {
-      setJwtToken(null);
-      onUnauthorized?.call();
+  static void _checkResponse(http.Response response, {bool isAuthEndpoint = false}) {
+    // Only fire onUnauthorized if:
+    // 1. Not an authentication route (/api/login, /api/register)
+    // 2. A JWT token was actually provided with the request (not an unauthenticated call)
+    if (response.statusCode == 401 && !isAuthEndpoint) {
+      if (_jwtToken != null && _jwtToken!.isNotEmpty) {
+        setJwtToken(null);
+        onUnauthorized?.call();
+      }
     }
   }
 
-  static dynamic _handleResponse(http.Response response) {
-    _checkResponse(response);
+  @visibleForTesting
+  static void checkResponseForTesting(http.Response response, {bool isAuthEndpoint = false}) {
+    _checkResponse(response, isAuthEndpoint: isAuthEndpoint);
+  }
+
+  static dynamic _handleResponse(http.Response response, {bool isAuthEndpoint = false}) {
+    _checkResponse(response, isAuthEndpoint: isAuthEndpoint);
     return jsonDecode(response.body);
   }
 
@@ -84,7 +94,7 @@ class ApiService {
           )
           .timeout(_timeout);
 
-      return _handleResponse(response);
+      return _handleResponse(response, isAuthEndpoint: true);
     } catch (e) {
       return {'success': false, 'error': 'Cannot connect to server: $e'};
     }
@@ -110,7 +120,7 @@ class ApiService {
           )
           .timeout(_timeout);
 
-      return _handleResponse(response);
+      return _handleResponse(response, isAuthEndpoint: true);
     } catch (e) {
       return {'success': false, 'error': 'Cannot connect to server: $e'};
     }
