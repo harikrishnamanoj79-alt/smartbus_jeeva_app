@@ -187,7 +187,7 @@ class AuthService {
       fullName: name.trim(),
       email: normalizedEmail,
       phoneNumber: normalizedPhone,
-      passwordHash: password.trim(),
+      password: password.trim(),
     ).then((result) async {
       if (result['success'] == true && result['user_id'] != null) {
         if (result['access_token'] != null) {
@@ -241,7 +241,7 @@ class AuthService {
     if (matchedUser == null) {
       final apiResult = await ApiService.loginUser(
         email: identifier.trim(),
-        passwordHash: normalizedPassword,
+        password: normalizedPassword,
       );
       if (apiResult['success'] == true && apiResult['user'] is Map) {
         if (apiResult['access_token'] != null) {

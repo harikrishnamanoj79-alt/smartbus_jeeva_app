@@ -3,11 +3,22 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 class ApiService {
-  static const String _deviceBaseUrl = 'http://192.168.220.34:5000';
-  static String get baseUrl => kIsWeb
-      ? '${Uri.base.scheme}://${Uri.base.host}:5000'
-      : _deviceBaseUrl;
-  static const Duration _timeout = Duration(seconds: 4);
+  static String _customBaseUrl = '';
+  static String get baseUrl {
+    if (_customBaseUrl.isNotEmpty) return _customBaseUrl;
+    const envUrl = String.fromEnvironment('API_BASE_URL');
+    if (envUrl.isNotEmpty) return envUrl;
+    if (kIsWeb) {
+      return '${Uri.base.scheme}://${Uri.base.host}:5000';
+    }
+    return 'http://10.0.2.2:5000';
+  }
+
+  static void setBaseUrl(String url) {
+    _customBaseUrl = url.trim().replaceAll(RegExp(r'/+$'), '');
+  }
+
+  static const Duration _timeout = Duration(seconds: 12);
 
   static String? _jwtToken;
 
@@ -41,8 +52,10 @@ class ApiService {
     required String fullName,
     required String email,
     required String phoneNumber,
-    required String passwordHash,
+    String? password,
+    String? passwordHash,
   }) async {
+    final effectivePassword = password ?? passwordHash ?? '';
     try {
       final response = await http
           .post(
@@ -52,7 +65,8 @@ class ApiService {
               'full_name': fullName,
               'email': email,
               'phone_number': phoneNumber,
-              'password_hash': passwordHash,
+              'password': effectivePassword,
+              'password_hash': effectivePassword,
             }),
           )
           .timeout(_timeout);
@@ -66,8 +80,10 @@ class ApiService {
   // Login user
   static Future<Map<String, dynamic>> loginUser({
     required String email,
-    required String passwordHash,
+    String? password,
+    String? passwordHash,
   }) async {
+    final effectivePassword = password ?? passwordHash ?? '';
     try {
       final response = await http
           .post(
@@ -75,7 +91,8 @@ class ApiService {
             headers: _headers,
             body: jsonEncode({
               'identifier': email,
-              'password_hash': passwordHash,
+              'password': effectivePassword,
+              'password_hash': effectivePassword,
             }),
           )
           .timeout(_timeout);
@@ -453,6 +470,25 @@ class ApiService {
       return {'success': false, 'fallback': 'device', 'error': 'Invalid response'};
     } catch (e) {
       return {'success': false, 'fallback': 'device', 'error': 'Cannot connect to server: $e'};
+    }
+  }
+
+  // Update SOS status (SENT, DELIVERED, FAILED)
+  static Future<bool> updateSosStatus({
+    required int sosId,
+    required String status,
+  }) async {
+    try {
+      final response = await http
+          .put(
+            Uri.parse('$baseUrl/api/sos/$sosId/status'),
+            headers: _headers,
+            body: jsonEncode({'status': status}),
+          )
+          .timeout(_timeout);
+      return response.statusCode == 200;
+    } catch (_) {
+      return false;
     }
   }
 

@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS tbl_saved_destinations (
     latitude          REAL NOT NULL,
     longitude         REAL NOT NULL,
     FOREIGN KEY (user_id) REFERENCES tbl_users (user_id)
-        ON DELETE CASCADE
+        ON DELETE CASCADE,
+    UNIQUE(user_id, destination_name)
 );
 
 -- 3. tbl_journey
@@ -88,16 +89,18 @@ CREATE TABLE IF NOT EXISTS tbl_emergency_contact (
     contact_phone  TEXT NOT NULL,
     relationship   TEXT,
     FOREIGN KEY (user_id) REFERENCES tbl_users (user_id)
-        ON DELETE CASCADE
+        ON DELETE CASCADE,
+    UNIQUE(user_id, contact_phone)
 );
 
 -- 7. tbl_sos_alert
 -- Logs each SOS event raised by a passenger, including the shared
--- location and status.
+-- location and status. journey_id is NULLABLE so an emergency SOS
+-- can be logged even when not on an active transit journey.
 CREATE TABLE IF NOT EXISTS tbl_sos_alert (
     sos_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id     INTEGER NOT NULL,
-    journey_id  INTEGER NOT NULL,
+    journey_id  INTEGER,
     latitude    REAL NOT NULL,
     longitude   REAL NOT NULL,
     sent_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -106,7 +109,7 @@ CREATE TABLE IF NOT EXISTS tbl_sos_alert (
     FOREIGN KEY (user_id) REFERENCES tbl_users (user_id)
         ON DELETE CASCADE,
     FOREIGN KEY (journey_id) REFERENCES tbl_journey (journey_id)
-        ON DELETE CASCADE
+        ON DELETE SET NULL
 );
 
 -- 8. tbl_journey_history
@@ -118,6 +121,7 @@ CREATE TABLE IF NOT EXISTS tbl_journey_history (
     journey_id           INTEGER NOT NULL,
     distance_travelled   REAL NOT NULL,
     travel_duration      TEXT NOT NULL,
+    duration_seconds     INTEGER DEFAULT 0,
     missed_stop_count    INTEGER DEFAULT 0,
     FOREIGN KEY (user_id) REFERENCES tbl_users (user_id)
         ON DELETE CASCADE,
@@ -126,7 +130,7 @@ CREATE TABLE IF NOT EXISTS tbl_journey_history (
 );
 
 -- ============================================================
--- Helpful indexes (not in the synopsis, added for performance)
+-- Helpful indexes
 -- ============================================================
 CREATE INDEX IF NOT EXISTS idx_journey_user ON tbl_journey(user_id);
 CREATE INDEX IF NOT EXISTS idx_alerts_journey ON tbl_alerts(journey_id);

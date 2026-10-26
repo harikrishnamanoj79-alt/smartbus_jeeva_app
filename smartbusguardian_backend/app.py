@@ -2,27 +2,101 @@
 SmartBus Guardian Flask Backend
 
 Flutter → Flask → SQLite
+Secured with JWT authentication, user scoping, rate limiting, and robust input validation.
 """
 
 from flask import Flask, request, jsonify, g
 import sqlite3
 import os
+import time
 import datetime
 from werkzeug.security import check_password_hash, generate_password_hash
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from flask_jwt_extended import (
+    JWTManager,
+    create_access_token,
+    jwt_required,
+    get_jwt_identity,
+)
 
 app = Flask(__name__)
 
 # JWT Configuration
-app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "super-secret-smartbus-key-change-in-prod")
+app.config["JWT_SECRET_KEY"] = os.environ.get(
+    "JWT_SECRET_KEY", "smartbus-guardian-production-secret-key-v1"
+)
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = datetime.timedelta(days=30)
 jwt = JWTManager(app)
+
+# In-memory sliding-window rate limit trackers
+LOGIN_ATTEMPTS = {}  # key -> list of timestamp floats
+SMS_ATTEMPTS = {}    # user_id -> list of timestamp floats
+
+HELPLINE_NUMBERS = {"112", "100", "108", "1091", "911", "999", "000"}
+
+
+def check_rate_limit(tracker_dict, key, max_attempts=5, window_seconds=300):
+    """
+    Returns True if allowed, False if rate limit exceeded.
+    """
+    now = time.time()
+    attempts = tracker_dict.get(key, [])
+    # Prune expired timestamps
+    attempts = [t for t in attempts if now - t < window_seconds]
+    if len(attempts) >= max_attempts:
+        tracker_dict[key] = attempts
+        return False
+    attempts.append(now)
+    tracker_dict[key] = attempts
+    return True
+
+
+def normalize_phone_number(raw_phone):
+    """
+    Normalizes a phone number into an E.164-compatible digit string.
+    """
+    if not isinstance(raw_phone, str):
+        return None
+    raw = raw_phone.strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return None
+    if raw.startswith("+"):
+        return f"+{digits}"
+    if len(digits) == 10:
+        return f"+91{digits}"
+    if len(digits) == 12 and digits.startswith("91"):
+        return f"+{digits}"
+    return f"+{digits}"
+
+
+def is_emergency_helpline_number(phone_str):
+    """
+    Checks if a phone number matches standard national emergency numbers,
+    avoiding accidental matches with regular 10-digit mobile numbers.
+    """
+    if not isinstance(phone_str, str):
+        return False
+    digits = "".join(ch for ch in phone_str if ch.isdigit())
+    if not digits:
+        return False
+    if digits in HELPLINE_NUMBERS:
+        return True
+    if digits.startswith("91") and len(digits) > 2 and digits[2:] in HELPLINE_NUMBERS:
+        return True
+    if digits.startswith("0091") and len(digits) > 4 and digits[4:] in HELPLINE_NUMBERS:
+        return True
+    return False
+
 
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization"
+    )
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET, POST, PUT, DELETE, OPTIONS"
+    )
     return response
 
 
@@ -38,13 +112,15 @@ DB_PATH = os.path.join(
 
 
 # ============================================================
-# HOME
+# HOME / HEALTH CHECK
 # ============================================================
 
 @app.route("/")
 def home():
     return jsonify({
-        "message": "SmartBus Guardian Backend is running!"
+        "status": "online",
+        "service": "SmartBus Guardian Backend",
+        "version": "2.0.0"
     })
 
 
@@ -57,14 +133,12 @@ def get_db():
         g.db = sqlite3.connect(DB_PATH)
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys = ON;")
-
     return g.db
 
 
 @app.teardown_appcontext
 def close_db(exception=None):
     db = g.pop("db", None)
-
     if db is not None:
         db.close()
 
@@ -75,71 +149,44 @@ def close_db(exception=None):
 
 @app.route("/api/register", methods=["POST"])
 def register_user():
-
     data = request.get_json(silent=True)
-
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
 
     full_name = data.get("full_name", "")
     email = data.get("email", "")
     phone_number = data.get("phone_number", "")
-    password = data.get("password", data.get("password_hash", ""))
+    password = data.get("password") or data.get("password_hash", "")
 
-    if not all(isinstance(value, str) for value in
-               (full_name, email, phone_number, password)):
+    if not all(isinstance(value, str) for value in (full_name, email, phone_number, password)):
         return jsonify({"error": "All registration fields must be text"}), 400
 
     full_name = full_name.strip()
     email = email.strip().lower()
     phone_number = phone_number.strip()
-    password = password.strip()
 
     if not full_name:
-        return jsonify({
-            "error": "Full name is required"
-        }), 400
-
-    if not email:
-        return jsonify({
-            "error": "Email is required"
-        }), 400
-
+        return jsonify({"error": "Full name is required"}), 400
+    if not email or "@" not in email:
+        return jsonify({"error": "A valid email address is required"}), 400
     if not phone_number:
-        return jsonify({
-            "error": "Phone number is required"
-        }), 400
-
-    if not password:
-        return jsonify({
-            "error": "Password is required"
-        }), 400
+        return jsonify({"error": "Phone number is required"}), 400
     if len(password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
 
+    normalized_phone = normalize_phone_number(phone_number)
+    if not normalized_phone:
+        return jsonify({"error": "Invalid phone number format"}), 400
+
     db = get_db()
-
     try:
-
         cur = db.execute(
             """
-            INSERT INTO tbl_users
-            (
-                full_name,
-                email,
-                phone_number,
-                password_hash
-            )
+            INSERT INTO tbl_users (full_name, email, phone_number, password_hash)
             VALUES (?, ?, ?, ?)
             """,
-            (
-                full_name,
-                email,
-                phone_number,
-                generate_password_hash(password)
-            )
+            (full_name, email, normalized_phone, generate_password_hash(password)),
         )
-
         db.commit()
         user_id = cur.lastrowid
         access_token = create_access_token(identity=str(user_id))
@@ -148,14 +195,20 @@ def register_user():
             "success": True,
             "user_id": user_id,
             "access_token": access_token,
-            "message": "User registered successfully"
+            "message": "User registered successfully",
+            "user": {
+                "id": user_id,
+                "user_id": user_id,
+                "full_name": full_name,
+                "email": email,
+                "phone_number": normalized_phone,
+            }
         }), 201
 
-    except sqlite3.IntegrityError as e:
-
+    except sqlite3.IntegrityError:
         return jsonify({
             "success": False,
-            "error": str(e)
+            "error": "An account with this email or phone number already exists"
         }), 400
 
 
@@ -165,67 +218,51 @@ def register_user():
 
 @app.route("/api/login", methods=["POST"])
 def login_user():
-
     data = request.get_json(silent=True)
-
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
 
-    identifier = data.get("identifier", "")
-    password = data.get("password", data.get("password_hash", ""))
+    identifier = data.get("identifier") or data.get("email") or ""
+    password = data.get("password") or data.get("password_hash") or ""
+
     if not isinstance(identifier, str) or not isinstance(password, str):
         return jsonify({"error": "Email/phone and password must be text"}), 400
+
     identifier = identifier.strip()
-    password = password.strip()
 
     if not identifier:
-        return jsonify({
-            "error": "Email or phone number is required"
-        }), 400
-
+        return jsonify({"error": "Email or phone number is required"}), 400
     if not password:
+        return jsonify({"error": "Password is required"}), 400
+
+    client_ip = request.remote_addr or "client"
+    rate_key = f"{client_ip}:{identifier.lower()}"
+    if not check_rate_limit(LOGIN_ATTEMPTS, rate_key, max_attempts=5, window_seconds=300):
         return jsonify({
-            "error": "Password is required"
-        }), 400
+            "success": False,
+            "error": "Too many failed login attempts. Please wait 5 minutes before trying again."
+        }), 429
 
     db = get_db()
-
     row = db.execute(
         """
-        SELECT
-            user_id,
-            full_name,
-            email,
-            phone_number,
-            password_hash
+        SELECT user_id, full_name, email, phone_number, password_hash
         FROM tbl_users
         WHERE email = ? OR phone_number = ?
         """,
-        (
-            identifier.lower(),
-            identifier
-        )
+        (identifier.lower(), identifier),
     ).fetchone()
 
+    password_matches = False
     if row:
-        stored_password = row["password_hash"]
+        stored_hash = row["password_hash"]
         try:
-            password_matches = check_password_hash(stored_password, password)
+            password_matches = check_password_hash(stored_hash, password)
         except (ValueError, TypeError):
             password_matches = False
 
-        if not password_matches and stored_password == password:
-            password_matches = True
-            db.execute(
-                "UPDATE tbl_users SET password_hash = ? WHERE user_id = ?",
-                (generate_password_hash(password), row["user_id"]),
-            )
-            db.commit()
-
-    else:
-        password_matches = False
-
     if row and password_matches:
+        LOGIN_ATTEMPTS.pop(rate_key, None)
         user_id = row["user_id"]
         access_token = create_access_token(identity=str(user_id))
 
@@ -238,7 +275,7 @@ def login_user():
                 "user_id": user_id,
                 "full_name": row["full_name"],
                 "email": row["email"],
-                "phone_number": row["phone_number"]
+                "phone_number": row["phone_number"],
             }
         }), 200
 
@@ -248,24 +285,30 @@ def login_user():
     }), 401
 
 
+# ============================================================
+# USER PROFILE & PASSWORD
+# ============================================================
+
 @app.route("/api/profile/<int:user_id>", methods=["POST"])
 @jwt_required()
 def update_profile(user_id):
-    current_user_id = get_jwt_identity()
-    if str(user_id) != current_user_id:
+    current_user_id = int(get_jwt_identity())
+    if user_id != current_user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
+
     full_name = data.get("full_name")
     email = data.get("email")
     phone_number = data.get("phone_number")
-    if not all(
-        isinstance(value, str) and value.strip()
-        for value in (full_name, email, phone_number)
-    ):
+    if not all(isinstance(v, str) and v.strip() for v in (full_name, email, phone_number)):
         return jsonify({"error": "Name, email, and phone number are required"}), 400
+
+    norm_phone = normalize_phone_number(phone_number)
+    if not norm_phone:
+        return jsonify({"error": "Invalid phone number"}), 400
 
     try:
         cursor = get_db().execute(
@@ -274,11 +317,12 @@ def update_profile(user_id):
             SET full_name = ?, email = ?, phone_number = ?
             WHERE user_id = ?
             """,
-            (full_name.strip(), email.strip().lower(), phone_number.strip(), user_id),
+            (full_name.strip(), email.strip().lower(), norm_phone, current_user_id),
         )
         get_db().commit()
-    except sqlite3.IntegrityError as error:
-        return jsonify({"error": str(error)}), 400
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Email or phone number is already taken"}), 400
+
     if cursor.rowcount == 0:
         return jsonify({"error": "User not found"}), 404
     return jsonify({"success": True}), 200
@@ -287,80 +331,79 @@ def update_profile(user_id):
 @app.route("/api/profile/<int:user_id>/password", methods=["POST"])
 @jwt_required()
 def update_password(user_id):
-    current_user_id = get_jwt_identity()
-    if str(user_id) != current_user_id:
+    current_user_id = int(get_jwt_identity())
+    if user_id != current_user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
+
     current_password = data.get("current_password")
     new_password = data.get("new_password")
     if not isinstance(current_password, str) or not isinstance(new_password, str):
         return jsonify({"error": "Current and new passwords are required"}), 400
-    if len(new_password.strip()) < 6:
+    if len(new_password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
 
     db = get_db()
     user = db.execute(
         "SELECT password_hash FROM tbl_users WHERE user_id = ?",
-        (user_id,),
+        (current_user_id,),
     ).fetchone()
     if user is None:
         return jsonify({"error": "User not found"}), 404
-    stored_password = user["password_hash"]
+
+    stored_hash = user["password_hash"]
     try:
-        password_matches = check_password_hash(
-            stored_password,
-            current_password.strip(),
-        )
+        password_matches = check_password_hash(stored_hash, current_password)
     except (ValueError, TypeError):
         password_matches = False
-    if not password_matches and stored_password == current_password.strip():
-        password_matches = True
+
     if not password_matches:
         return jsonify({"error": "Current password does not match"}), 400
 
     db.execute(
         "UPDATE tbl_users SET password_hash = ? WHERE user_id = ?",
-        (generate_password_hash(new_password.strip()), user_id),
+        (generate_password_hash(new_password), current_user_id),
     )
     db.commit()
     return jsonify({"success": True}), 200
 
 
 # ============================================================
-# START JOURNEY
+# JOURNEY
 # ============================================================
 
 @app.route("/api/journey/start", methods=["POST"])
 @jwt_required()
 def start_journey():
-    current_user_id = get_jwt_identity()
+    current_user_id = int(get_jwt_identity())
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
 
     required_text = ("source_location", "destination_location")
-    if any(not isinstance(data.get(key), str) or not data[key].strip()
-           for key in required_text):
+    if any(not isinstance(data.get(k), str) or not data[k].strip() for k in required_text):
         return jsonify({"error": "Source and destination are required"}), 400
 
     try:
-        user_id = int(data["user_id"])
         latitude = float(data["dest_latitude"])
         longitude = float(data["dest_longitude"])
     except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "A user and valid destination coordinates are required"}), 400
+        return jsonify({"error": "Valid destination coordinates are required"}), 400
+
     if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
         return jsonify({"error": "Destination coordinates are out of range"}), 400
 
     db = get_db()
+    user_check = db.execute("SELECT user_id FROM tbl_users WHERE user_id = ?", (current_user_id,)).fetchone()
+    if user_check is None:
+        return jsonify({"error": "User not found"}), 404
 
-    try:
-        cur = db.execute(
-            """
+    cur = db.execute(
+        """
         INSERT INTO tbl_journey
         (
             user_id,
@@ -373,18 +416,15 @@ def start_journey():
         )
         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         """,
-            (
-                user_id,
-                data["source_location"].strip(),
-                data["destination_location"].strip(),
-                latitude,
-                longitude,
-                int(bool(data.get("sleep_mode_enabled", 0))),
-            ),
-        )
-    except sqlite3.IntegrityError as error:
-        return jsonify({"error": str(error)}), 400
-
+        (
+            current_user_id,
+            data["source_location"].strip(),
+            data["destination_location"].strip(),
+            latitude,
+            longitude,
+            int(bool(data.get("sleep_mode_enabled", 0))),
+        ),
+    )
     db.commit()
 
     return jsonify({
@@ -396,16 +436,17 @@ def start_journey():
 @app.route("/api/journey/<int:journey_id>/finish", methods=["POST"])
 @jwt_required()
 def finish_journey(journey_id):
-    current_user_id = get_jwt_identity()
+    current_user_id = int(get_jwt_identity())
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
+
     try:
-        user_id = int(data["user_id"])
         distance = float(data["distance_travelled"])
     except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "user_id and distance_travelled are required"}), 400
+        return jsonify({"error": "distance_travelled is required"}), 400
+
     status = data.get("status", "COMPLETED")
     if status not in ("COMPLETED", "MISSED"):
         return jsonify({"error": "Journey status must be COMPLETED or MISSED"}), 400
@@ -418,20 +459,21 @@ def finish_journey(journey_id):
         SELECT start_time FROM tbl_journey
         WHERE journey_id = ? AND user_id = ?
         """,
-        (journey_id, user_id),
+        (journey_id, current_user_id),
     ).fetchone()
     if journey is None:
-        return jsonify({"error": "Journey not found"}), 404
+        return jsonify({"error": "Journey not found or not owned by user"}), 404
 
     end_time = db.execute("SELECT CURRENT_TIMESTAMP").fetchone()[0]
     duration_minutes = 0
+    duration_seconds = 0
     try:
-        from datetime import datetime
-        started = datetime.fromisoformat(journey["start_time"])
-        ended = datetime.fromisoformat(end_time)
-        duration_minutes = max(0, int((ended - started).total_seconds() // 60))
+        started = datetime.datetime.fromisoformat(journey["start_time"])
+        ended = datetime.datetime.fromisoformat(end_time)
+        duration_seconds = max(0, int((ended - started).total_seconds()))
+        duration_minutes = duration_seconds // 60
     except (TypeError, ValueError):
-        duration_minutes = 0
+        pass
 
     db.execute(
         """
@@ -439,22 +481,24 @@ def finish_journey(journey_id):
         SET journey_status = ?, end_time = ?
         WHERE journey_id = ? AND user_id = ?
         """,
-        (status, end_time, journey_id, user_id),
+        (status, end_time, journey_id, current_user_id),
     )
     missed_count = db.execute(
         "SELECT COUNT(*) FROM tbl_missed_stop WHERE journey_id = ?",
         (journey_id,),
     ).fetchone()[0]
+
     existing_history = db.execute(
         "SELECT history_id FROM tbl_journey_history WHERE journey_id = ?",
         (journey_id,),
     ).fetchone()
-    values = (distance, f"{duration_minutes} minutes", missed_count)
+
+    values = (distance, f"{duration_minutes} minutes", duration_seconds, missed_count)
     if existing_history:
         db.execute(
             """
             UPDATE tbl_journey_history
-            SET distance_travelled = ?, travel_duration = ?, missed_stop_count = ?
+            SET distance_travelled = ?, travel_duration = ?, duration_seconds = ?, missed_stop_count = ?
             WHERE history_id = ?
             """,
             (*values, existing_history["history_id"]),
@@ -463,26 +507,27 @@ def finish_journey(journey_id):
         db.execute(
             """
             INSERT INTO tbl_journey_history
-            (user_id, journey_id, distance_travelled, travel_duration, missed_stop_count)
-            VALUES (?, ?, ?, ?, ?)
+            (user_id, journey_id, distance_travelled, travel_duration, duration_seconds, missed_stop_count)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (user_id, journey_id, *values),
+            (current_user_id, journey_id, *values),
         )
     db.commit()
     return jsonify({"success": True, "journey_id": journey_id}), 200
 
 
+@app.route("/api/journey/history", methods=["GET"])
 @app.route("/api/journey/history/<int:user_id>", methods=["GET"])
 @jwt_required()
-def get_journey_history(user_id):
-    current_user_id = get_jwt_identity()
-    if str(user_id) != current_user_id:
+def get_journey_history(user_id=None):
+    current_user_id = int(get_jwt_identity())
+    if user_id is not None and user_id != current_user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
     rows = get_db().execute(
         """
         SELECT h.history_id, h.journey_id, h.distance_travelled,
-               h.travel_duration, h.missed_stop_count, j.user_id,
+               h.travel_duration, h.duration_seconds, h.missed_stop_count, j.user_id,
                j.source_location, j.destination_location, j.dest_latitude,
                j.dest_longitude, j.sleep_mode_enabled, j.start_time,
                j.end_time, j.journey_status
@@ -491,7 +536,7 @@ def get_journey_history(user_id):
         WHERE h.user_id = ?
         ORDER BY j.start_time DESC
         """,
-        (user_id,),
+        (current_user_id,),
     ).fetchall()
     return jsonify({
         "success": True,
@@ -505,8 +550,8 @@ def get_journey_history(user_id):
 )
 @jwt_required()
 def delete_journey_history(user_id, journey_id):
-    current_user_id = get_jwt_identity()
-    if str(user_id) != current_user_id:
+    current_user_id = int(get_jwt_identity())
+    if user_id != current_user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
     cursor = get_db().execute(
@@ -514,7 +559,7 @@ def delete_journey_history(user_id, journey_id):
         DELETE FROM tbl_journey_history
         WHERE user_id = ? AND journey_id = ?
         """,
-        (user_id, journey_id),
+        (current_user_id, journey_id),
     )
     get_db().commit()
     if cursor.rowcount == 0:
@@ -525,20 +570,27 @@ def delete_journey_history(user_id, journey_id):
 @app.route("/api/journey/history/<int:user_id>", methods=["DELETE"])
 @jwt_required()
 def clear_journey_history(user_id):
-    current_user_id = get_jwt_identity()
-    if str(user_id) != current_user_id:
+    current_user_id = int(get_jwt_identity())
+    if user_id != current_user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
     get_db().execute(
         "DELETE FROM tbl_journey_history WHERE user_id = ?",
-        (user_id,),
+        (current_user_id,),
     )
     get_db().commit()
     return jsonify({"success": True}), 200
 
 
+# ============================================================
+# MISSED STOP & ALERTS
+# ============================================================
+
 @app.route("/api/missed-stop", methods=["POST"])
+@jwt_required()
 def record_missed_stop():
+    current_user_id = int(get_jwt_identity())
+
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
@@ -548,6 +600,7 @@ def record_missed_stop():
         longitude = float(data["missed_longitude"])
     except (KeyError, TypeError, ValueError):
         return jsonify({"error": "Journey and valid missed-stop coordinates are required"}), 400
+
     return_stop = data.get("nearest_return_stop")
     if not isinstance(return_stop, str) or not return_stop.strip():
         return jsonify({"error": "nearest_return_stop is required"}), 400
@@ -555,29 +608,36 @@ def record_missed_stop():
         return jsonify({"error": "Missed-stop coordinates are out of range"}), 400
 
     db = get_db()
-    try:
-        cur = db.execute(
-            """
-            INSERT INTO tbl_missed_stop
-            (journey_id, missed_latitude, missed_longitude, nearest_return_stop, alternate_route)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                journey_id,
-                latitude,
-                longitude,
-                return_stop.strip(),
-                str(data.get("alternate_route") or "").strip() or None,
-            ),
-        )
-        db.commit()
-    except sqlite3.IntegrityError as error:
-        return jsonify({"error": str(error)}), 400
+    journey = db.execute(
+        "SELECT user_id FROM tbl_journey WHERE journey_id = ? AND user_id = ?",
+        (journey_id, current_user_id)
+    ).fetchone()
+    if journey is None:
+        return jsonify({"error": "Journey not found or not owned by caller"}), 404
+
+    cur = db.execute(
+        """
+        INSERT INTO tbl_missed_stop
+        (journey_id, missed_latitude, missed_longitude, nearest_return_stop, alternate_route)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            journey_id,
+            latitude,
+            longitude,
+            return_stop.strip(),
+            str(data.get("alternate_route") or "").strip() or None,
+        ),
+    )
+    db.commit()
     return jsonify({"success": True, "missed_id": cur.lastrowid}), 201
 
 
 @app.route("/api/alerts", methods=["POST"])
+@jwt_required()
 def record_alert():
+    current_user_id = int(get_jwt_identity())
+
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
@@ -586,30 +646,42 @@ def record_alert():
         distance = float(data["distance_remaining"])
     except (KeyError, TypeError, ValueError):
         return jsonify({"error": "Journey and distance_remaining are required"}), 400
+
     alert_type = data.get("alert_type")
     if alert_type not in ("VOICE", "VIBRATION", "ALARM", "SCREEN"):
         return jsonify({"error": "Unsupported alert_type"}), 400
     if distance < 0:
         return jsonify({"error": "distance_remaining cannot be negative"}), 400
-    try:
-        cursor = get_db().execute(
-            """
-            INSERT INTO tbl_alerts (journey_id, alert_type, distance_remaining)
-            VALUES (?, ?, ?)
-            """,
-            (journey_id, alert_type, distance),
-        )
-        get_db().commit()
-    except sqlite3.IntegrityError as error:
-        return jsonify({"error": str(error)}), 400
+
+    db = get_db()
+    journey = db.execute(
+        "SELECT user_id FROM tbl_journey WHERE journey_id = ? AND user_id = ?",
+        (journey_id, current_user_id)
+    ).fetchone()
+    if journey is None:
+        return jsonify({"error": "Journey not found or not owned by caller"}), 404
+
+    cursor = db.execute(
+        """
+        INSERT INTO tbl_alerts (journey_id, alert_type, distance_remaining)
+        VALUES (?, ?, ?)
+        """,
+        (journey_id, alert_type, distance),
+    )
+    db.commit()
     return jsonify({"success": True, "alert_id": cursor.lastrowid}), 201
 
 
+# ============================================================
+# SAVED DESTINATIONS
+# ============================================================
+
+@app.route("/api/saved-destinations", methods=["GET"])
 @app.route("/api/saved-destinations/<int:user_id>", methods=["GET"])
 @jwt_required()
-def get_saved_destinations(user_id):
-    current_user_id = get_jwt_identity()
-    if str(user_id) != current_user_id:
+def get_saved_destinations(user_id=None):
+    current_user_id = int(get_jwt_identity())
+    if user_id is not None and user_id != current_user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
     rows = get_db().execute(
@@ -619,7 +691,7 @@ def get_saved_destinations(user_id):
         WHERE user_id = ?
         ORDER BY destination_name COLLATE NOCASE
         """,
-        (user_id,),
+        (current_user_id,),
     ).fetchall()
     return jsonify({"success": True, "destinations": [dict(row) for row in rows]}), 200
 
@@ -627,22 +699,25 @@ def get_saved_destinations(user_id):
 @app.route("/api/saved-destinations", methods=["POST"])
 @jwt_required()
 def add_saved_destination():
-    current_user_id = get_jwt_identity()
+    current_user_id = int(get_jwt_identity())
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
+
     name = data.get("destination_name")
     try:
-        user_id = int(data["user_id"])
         latitude = float(data["latitude"])
         longitude = float(data["longitude"])
     except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "User and valid destination coordinates are required"}), 400
+        return jsonify({"error": "Valid destination coordinates are required"}), 400
+
     if not isinstance(name, str) or not name.strip():
         return jsonify({"error": "destination_name is required"}), 400
     if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
         return jsonify({"error": "Destination coordinates are out of range"}), 400
+
+    name = name.strip()
     try:
         cursor = get_db().execute(
             """
@@ -650,73 +725,65 @@ def add_saved_destination():
             (user_id, destination_name, latitude, longitude)
             VALUES (?, ?, ?, ?)
             """,
-            (user_id, name.strip(), latitude, longitude),
+            (current_user_id, name, latitude, longitude),
         )
         get_db().commit()
-    except sqlite3.IntegrityError as error:
-        return jsonify({"error": str(error)}), 400
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "A destination with this name already exists"}), 400
+
     return jsonify({"success": True, "destination_id": cursor.lastrowid}), 201
 
 
 @app.route("/api/saved-destinations/<int:destination_id>", methods=["DELETE"])
 @jwt_required()
 def delete_saved_destination(destination_id):
-    current_user_id = get_jwt_identity()
-    # We should ideally check if the destination belongs to current user.
-    # For now we'll just check if a user is logged in.
+    current_user_id = int(get_jwt_identity())
 
     cursor = get_db().execute(
-        "DELETE FROM tbl_saved_destinations WHERE destination_id = ?",
-        (destination_id,),
+        "DELETE FROM tbl_saved_destinations WHERE destination_id = ? AND user_id = ?",
+        (destination_id, current_user_id),
     )
     get_db().commit()
     if cursor.rowcount == 0:
-        return jsonify({"error": "Saved destination not found"}), 404
+        return jsonify({"error": "Saved destination not found or not owned by caller"}), 404
     return jsonify({"success": True}), 200
 
-# ============================================================
-# UPDATE SAVED DESTINATION
-# ============================================================
 
 @app.route("/api/saved-destinations/<int:destination_id>", methods=["PUT"])
 @jwt_required()
 def update_saved_destination(destination_id):
-    current_user_id = get_jwt_identity()
+    current_user_id = int(get_jwt_identity())
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
     try:
-        user_id = int(data["user_id"])
-        name = data.get("destination_name", "").strip()
+        name = str(data.get("destination_name", "")).strip()
         latitude = float(data["latitude"])
         longitude = float(data["longitude"])
     except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "user_id, destination_name and valid coordinates are required"}), 400
+        return jsonify({"error": "destination_name and valid coordinates are required"}), 400
+
     if not name:
         return jsonify({"error": "destination_name cannot be empty"}), 400
-    # Verify ownership
-    cur = get_db().execute(
+
+    db = get_db()
+    existing = db.execute(
         "SELECT user_id FROM tbl_saved_destinations WHERE destination_id = ?",
         (destination_id,)
     ).fetchone()
-    if cur is None or cur["user_id"] != user_id:
-        return jsonify({"error": "Destination not found or not owned by user"}), 404
-    # Prevent duplicate for same user (same name and coordinates)
-    exists = get_db().execute(
-        "SELECT destination_id FROM tbl_saved_destinations WHERE user_id = ? AND destination_name = ? AND latitude = ? AND longitude = ? AND destination_id != ?",
-        (user_id, name, latitude, longitude, destination_id)
-    ).fetchone()
-    if exists:
-        return jsonify({"error": "Another saved destination with same details already exists"}), 400
+    if existing is None or existing["user_id"] != current_user_id:
+        return jsonify({"error": "Destination not found or not owned by caller"}), 404
+
     try:
-        get_db().execute(
+        db.execute(
             "UPDATE tbl_saved_destinations SET destination_name = ?, latitude = ?, longitude = ? WHERE destination_id = ?",
             (name, latitude, longitude, destination_id)
         )
-        get_db().commit()
-    except sqlite3.IntegrityError as e:
-        return jsonify({"error": str(e)}), 400
+        db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Another destination with this name already exists"}), 400
+
     return jsonify({"success": True, "destination_id": destination_id}), 200
 
 
@@ -724,22 +791,22 @@ def update_saved_destination(destination_id):
 # EMERGENCY CONTACTS
 # ============================================================
 
+@app.route("/api/contacts", methods=["GET"])
 @app.route("/api/contacts/<int:user_id>", methods=["GET"])
 @jwt_required()
-def get_emergency_contacts(user_id):
-    current_user_id = get_jwt_identity()
-    if str(user_id) != current_user_id:
+def get_emergency_contacts(user_id=None):
+    current_user_id = int(get_jwt_identity())
+    if user_id is not None and user_id != current_user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
-    db = get_db()
-    rows = db.execute(
+    rows = get_db().execute(
         """
         SELECT contact_id, user_id, contact_name, contact_phone, relationship
         FROM tbl_emergency_contact
         WHERE user_id = ?
         ORDER BY contact_id DESC
         """,
-        (user_id,)
+        (current_user_id,)
     ).fetchall()
 
     contacts = [
@@ -759,40 +826,68 @@ def get_emergency_contacts(user_id):
 @app.route("/api/contacts", methods=["POST"])
 @jwt_required()
 def add_emergency_contact():
-    current_user_id = get_jwt_identity()
+    current_user_id = int(get_jwt_identity())
 
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No data received"}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "A JSON object is required"}), 400
 
-    user_id = data.get("user_id")
-    contact_name = data.get("contact_name", "").strip()
-    contact_phone = data.get("contact_phone", "").strip()
-    relationship = data.get("relationship", "Emergency Contact").strip()
+    contact_name = data.get("contact_name")
+    contact_phone = data.get("contact_phone")
+    relationship = data.get("relationship", "Emergency Contact")
 
-    if not user_id or not contact_name or not contact_phone:
-        return jsonify({"error": "user_id, contact_name, and contact_phone are required"}), 400
+    if not isinstance(contact_name, str) or not isinstance(contact_phone, str):
+        return jsonify({"error": "contact_name and contact_phone must be text"}), 400
 
-    if is_emergency_helpline_number(contact_phone):
+    contact_name = contact_name.strip()
+    contact_phone = contact_phone.strip()
+    relationship = str(relationship).strip() if relationship else "Emergency Contact"
+
+    if not contact_name or not contact_phone:
+        return jsonify({"error": "contact_name and contact_phone are required"}), 400
+
+    normalized_phone = normalize_phone_number(contact_phone)
+    if not normalized_phone:
+        return jsonify({"error": "Invalid phone number format"}), 400
+
+    if is_emergency_helpline_number(normalized_phone):
         return jsonify({
             "success": False,
-            "error": "Emergency helpline numbers cannot be saved as trusted contacts"
+            "error": "Emergency helpline numbers cannot be saved as personal trusted contacts"
         }), 400
 
     db = get_db()
-    cur = db.execute(
-        """
-        INSERT INTO tbl_emergency_contact
-        (user_id, contact_name, contact_phone, relationship)
-        VALUES (?, ?, ?, ?)
-        """,
-        (user_id, contact_name, contact_phone, relationship)
-    )
-    db.commit()
+    # Limit contacts to maximum 10
+    count = db.execute(
+        "SELECT COUNT(*) FROM tbl_emergency_contact WHERE user_id = ?",
+        (current_user_id,)
+    ).fetchone()[0]
+    if count >= 10:
+        return jsonify({"error": "Maximum of 10 emergency contacts allowed"}), 400
+
+    try:
+        cur = db.execute(
+            """
+            INSERT INTO tbl_emergency_contact
+            (user_id, contact_name, contact_phone, relationship)
+            VALUES (?, ?, ?, ?)
+            """,
+            (current_user_id, contact_name, normalized_phone, relationship)
+        )
+        db.commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "A contact with this phone number already exists"}), 400
 
     return jsonify({
         "success": True,
         "contact_id": cur.lastrowid,
+        "contact": {
+            "contact_id": cur.lastrowid,
+            "user_id": current_user_id,
+            "contact_name": contact_name,
+            "contact_phone": normalized_phone,
+            "relationship": relationship
+        },
         "message": "Emergency contact added successfully"
     }), 201
 
@@ -800,50 +895,71 @@ def add_emergency_contact():
 @app.route("/api/contacts/<int:contact_id>", methods=["DELETE"])
 @jwt_required()
 def delete_emergency_contact(contact_id):
-    current_user_id = get_jwt_identity()
+    current_user_id = int(get_jwt_identity())
 
     db = get_db()
-    db.execute("DELETE FROM tbl_emergency_contact WHERE contact_id = ?", (contact_id,))
+    cur = db.execute(
+        "DELETE FROM tbl_emergency_contact WHERE contact_id = ? AND user_id = ?",
+        (contact_id, current_user_id)
+    )
     db.commit()
-    return jsonify({"success": True, "message": "Emergency contact deleted"}), 200
+    if cur.rowcount == 0:
+        return jsonify({"error": "Emergency contact not found or not owned by caller"}), 404
+    return jsonify({"success": True}), 200
 
 
-def is_emergency_helpline_number(phone_number):
-    digits = "".join(ch for ch in str(phone_number) if ch.isdigit())
-    helpline_numbers = {"112", "100", "1091", "108", "911", "999", "000"}
-    if digits in helpline_numbers:
-        return True
-    if digits.startswith("91") and digits[2:] in helpline_numbers:
-        return True
-    if digits.startswith("0091") and digits[4:] in helpline_numbers:
-        return True
-    return False
-
+# ============================================================
+# SMS SERVICE (SECURED TWILIO RELAY)
+# ============================================================
 
 @app.route("/api/sms/send", methods=["POST"])
+@jwt_required()
 def send_sms_message():
-    data = request.get_json(silent=True) or {}
-    phones = data.get("phones") or data.get("phone_numbers") or []
-    message = str(data.get("message", "") or "").strip()
+    current_user_id = int(get_jwt_identity())
 
-    if not phones or not message:
+    # Rate limiting: maximum 5 SMS broadcasts per 60 seconds per user
+    if not check_rate_limit(SMS_ATTEMPTS, current_user_id, max_attempts=5, window_seconds=60):
         return jsonify({
             "success": False,
             "fallback": "device",
-            "error": "phones and message are required"
+            "error": "SMS rate limit exceeded. Please wait a moment before sending more emergency alerts."
+        }), 429
+
+    data = request.get_json(silent=True) or {}
+    message = str(data.get("message", "") or "").strip()
+
+    if not message:
+        return jsonify({
+            "success": False,
+            "fallback": "device",
+            "error": "Emergency message content is required"
         }), 400
 
-    normalized_numbers = []
-    for raw_phone in phones:
-        clean_phone = "".join(ch for ch in str(raw_phone) if ch.isdigit() or ch == "+")
-        if clean_phone and not is_emergency_helpline_number(clean_phone):
-            normalized_numbers.append(clean_phone)
+    # Look up emergency contacts ONLY from DB for this authenticated user
+    db = get_db()
+    contact_rows = db.execute(
+        "SELECT contact_phone, contact_name FROM tbl_emergency_contact WHERE user_id = ?",
+        (current_user_id,)
+    ).fetchall()
 
-    if not normalized_numbers:
+    if not contact_rows:
+        return jsonify({
+            "success": False,
+            "fallback": "device",
+            "error": "No emergency contacts configured for your account. Please add contacts first."
+        }), 400
+
+    eligible_numbers = []
+    for row in contact_rows:
+        norm = normalize_phone_number(row["contact_phone"])
+        if norm and not is_emergency_helpline_number(norm):
+            eligible_numbers.append(norm)
+
+    if not eligible_numbers:
         return jsonify({
             "success": False,
             "fallback": "none",
-            "error": "no eligible trusted contact numbers were provided; emergency helplines are excluded"
+            "error": "No eligible personal trusted contacts available (helplines excluded)"
         }), 400
 
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
@@ -860,28 +976,30 @@ def send_sms_message():
 
     try:
         from twilio.rest import Client
-
         client = Client(account_sid, auth_token)
-        for phone_number in normalized_numbers:
+        sent_count = 0
+        for phone_number in eligible_numbers:
             client.messages.create(
                 body=message,
                 from_=from_number,
                 to=phone_number,
             )
+            sent_count += 1
 
         return jsonify({
             "success": True,
             "fallback": "none",
             "backend": "twilio",
-            "sent_to": len(normalized_numbers),
-            "message": "Emergency SMS sent successfully via backend"
+            "sent_to": sent_count,
+            "message": f"Emergency SMS sent successfully via backend to {sent_count} contact(s)"
         }), 200
     except Exception as exc:
+        app.logger.error("Twilio SMS transmission failed: %s", exc)
         return jsonify({
             "success": False,
             "fallback": "device",
             "backend": "twilio",
-            "error": str(exc)
+            "error": "Failed to deliver SMS through gateway. Device SMS fallback will be used."
         }), 502
 
 
@@ -892,47 +1010,47 @@ def send_sms_message():
 @app.route("/api/sos", methods=["POST"])
 @jwt_required()
 def raise_sos():
-    current_user_id = get_jwt_identity()
+    current_user_id = int(get_jwt_identity())
 
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return jsonify({"error": "A JSON object is required"}), 400
+
     try:
-        user_id = int(data["user_id"])
         latitude = float(data["latitude"])
         longitude = float(data["longitude"])
     except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "User and valid GPS coordinates are required"}), 400
-    if user_id <= 0 or not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-        return jsonify({"error": "User or GPS coordinates are out of range"}), 400
+        return jsonify({"error": "Valid GPS coordinates (latitude, longitude) are required"}), 400
+
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        return jsonify({"error": "GPS coordinates are out of range"}), 400
 
     db = get_db()
     raw_journey_id = data.get("journey_id")
-    if raw_journey_id is None:
-        journey = db.execute(
+    journey_id = None
+    if raw_journey_id is not None:
+        try:
+            candidate_id = int(raw_journey_id)
+            journey = db.execute(
+                "SELECT journey_id FROM tbl_journey WHERE journey_id = ? AND user_id = ?",
+                (candidate_id, current_user_id),
+            ).fetchone()
+            if journey is not None:
+                journey_id = candidate_id
+        except (TypeError, ValueError):
+            pass
+
+    if journey_id is None:
+        ongoing = db.execute(
             """
             SELECT journey_id FROM tbl_journey
             WHERE user_id = ? AND journey_status = 'ONGOING'
             ORDER BY journey_id DESC LIMIT 1
             """,
-            (user_id,),
+            (current_user_id,),
         ).fetchone()
-        if journey is None:
-            return jsonify({
-                "error": "SOS logging requires an active journey"
-            }), 409
-        journey_id = journey["journey_id"]
-    else:
-        try:
-            journey_id = int(raw_journey_id)
-        except (TypeError, ValueError):
-            return jsonify({"error": "A valid journey_id is required"}), 400
-        journey = db.execute(
-            "SELECT journey_id FROM tbl_journey WHERE journey_id = ? AND user_id = ?",
-            (journey_id, user_id),
-        ).fetchone()
-        if journey is None:
-            return jsonify({"error": "Journey not found for this user"}), 404
+        if ongoing is not None:
+            journey_id = ongoing["journey_id"]
 
     cur = db.execute(
         """
@@ -947,13 +1065,12 @@ def raise_sos():
         VALUES (?, ?, ?, ?, 'SENT')
         """,
         (
-            user_id,
+            current_user_id,
             journey_id,
             latitude,
             longitude,
         ),
     )
-
     db.commit()
 
     return jsonify({
@@ -965,11 +1082,33 @@ def raise_sos():
     }), 201
 
 
+@app.route("/api/sos/<int:sos_id>/status", methods=["PUT"])
+@jwt_required()
+def update_sos_status(sos_id):
+    current_user_id = int(get_jwt_identity())
+    data = request.get_json(silent=True) or {}
+    status = data.get("status")
+    if status not in ("SENT", "DELIVERED", "FAILED"):
+        return jsonify({"error": "Status must be SENT, DELIVERED, or FAILED"}), 400
+
+    db = get_db()
+    cur = db.execute(
+        "UPDATE tbl_sos_alert SET status = ? WHERE sos_id = ? AND user_id = ?",
+        (status, sos_id, current_user_id)
+    )
+    db.commit()
+    if cur.rowcount == 0:
+        return jsonify({"error": "SOS alert not found or not owned by caller"}), 404
+
+    return jsonify({"success": True, "sos_id": sos_id, "status": status}), 200
+
+
+@app.route("/api/sos", methods=["GET"])
 @app.route("/api/sos/<int:user_id>", methods=["GET"])
 @jwt_required()
-def get_sos_history(user_id):
-    current_user_id = get_jwt_identity()
-    if str(user_id) != current_user_id:
+def get_sos_history(user_id=None):
+    current_user_id = int(get_jwt_identity())
+    if user_id is not None and user_id != current_user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
     db = get_db()
@@ -980,7 +1119,7 @@ def get_sos_history(user_id):
         WHERE user_id = ?
         ORDER BY sent_at DESC
         """,
-        (user_id,)
+        (current_user_id,)
     ).fetchall()
 
     alerts = [
@@ -1004,8 +1143,14 @@ def get_sos_history(user_id):
 # ============================================================
 
 if __name__ == "__main__":
-    app.run(
-        debug=True,
-        host="0.0.0.0",
-        port=5000
-    )
+    is_debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    port = int(os.environ.get("PORT", 5000))
+    host = os.environ.get("HOST", "127.0.0.1" if is_debug else "0.0.0.0")
+
+    if is_debug:
+        print(f"Starting development server on {host}:{port} (debug=True)")
+        app.run(debug=True, host=host, port=port)
+    else:
+        print(f"Starting production server (waitress) on {host}:{port} (debug=False)")
+        from waitress import serve
+        serve(app, host=host, port=port)

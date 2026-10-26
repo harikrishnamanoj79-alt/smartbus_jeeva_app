@@ -33,16 +33,20 @@ Uri buildSosSmsUri(
 
 bool isEmergencyHelplinePhoneNumber(String phoneNumber) {
   final digits = phoneNumber.replaceAll(RegExp(r'\D'), '');
+  if (digits.isEmpty) return false;
   const helplineNumbers = {'112', '100', '1091', '108', '911', '999', '000'};
 
   if (helplineNumbers.contains(digits)) return true;
-  if (digits.startsWith('91') &&
-      helplineNumbers.contains(digits.substring(2))) {
-    return true;
-  }
-  if (digits.startsWith('0091') &&
-      helplineNumbers.contains(digits.substring(4))) {
-    return true;
+  // Only check prefix stripping for shortcodes (total length <= 6) to protect standard national numbers
+  if (digits.length <= 6) {
+    if (digits.startsWith('91') &&
+        helplineNumbers.contains(digits.substring(2))) {
+      return true;
+    }
+    if (digits.startsWith('0091') &&
+        helplineNumbers.contains(digits.substring(4))) {
+      return true;
+    }
   }
   return false;
 }
