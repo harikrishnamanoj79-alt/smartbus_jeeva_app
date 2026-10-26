@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"name": "smartbus_guardian",
+			"path": "../.."
+		}
+	],
+	"settings": {
+		"cmake.sourceDirectory": "C:/Users/krish/smartbus_guardian/linux"
+	}
+}
