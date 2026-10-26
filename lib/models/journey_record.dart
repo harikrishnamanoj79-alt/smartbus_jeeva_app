@@ -2,6 +2,7 @@ import 'dart:convert';
 
 class JourneyRecord {
   final String id;
+  final int? backendId;
   final int userId;
   final String sourceLocation;
   final String destinationName;
@@ -18,7 +19,8 @@ class JourneyRecord {
 
   JourneyRecord({
     required this.id,
-    this.userId = 1,
+    this.backendId,
+    required this.userId,
     this.sourceLocation = 'Current Location',
     required this.destinationName,
     this.destinationAddress,
@@ -41,6 +43,7 @@ class JourneyRecord {
 
   JourneyRecord copyWith({
     String? id,
+    int? backendId,
     int? userId,
     String? sourceLocation,
     String? destinationName,
@@ -57,6 +60,7 @@ class JourneyRecord {
   }) {
     return JourneyRecord(
       id: id ?? this.id,
+      backendId: backendId ?? this.backendId,
       userId: userId ?? this.userId,
       sourceLocation: sourceLocation ?? this.sourceLocation,
       destinationName: destinationName ?? this.destinationName,
@@ -76,6 +80,7 @@ class JourneyRecord {
   Map<String, dynamic> toMap() {
     return {
       'id': id,
+      if (backendId != null) 'backendId': backendId,
       'userId': userId,
       'sourceLocation': sourceLocation,
       'destinationName': destinationName,
@@ -94,26 +99,46 @@ class JourneyRecord {
 
   factory JourneyRecord.fromMap(Map<String, dynamic> map) {
     return JourneyRecord(
-      id: map['id']?.toString() ?? DateTime.now().millisecondsSinceEpoch.toString(),
+      id:
+          map['id']?.toString() ??
+          map['journey_id']?.toString() ??
+          DateTime.now().millisecondsSinceEpoch.toString(),
+      backendId: ((map['backendId'] ?? map['journey_id']) as num?)?.toInt(),
       userId: map['userId'] is int
           ? map['userId']
-          : int.tryParse(map['userId']?.toString() ?? '1') ?? 1,
-      sourceLocation: map['sourceLocation'] ?? 'Starting Point',
-      destinationName: map['destinationName'] ?? map['destination_location'] ?? 'Destination',
-      destinationAddress: map['destinationAddress'],
+          : int.tryParse((map['userId'] ?? map['user_id'])?.toString() ?? '') ??
+                0,
+      sourceLocation:
+          map['sourceLocation'] ?? map['source_location'] ?? 'Starting Point',
+      destinationName:
+          map['destinationName'] ??
+          map['destination_location'] ??
+          'Destination',
+      destinationAddress:
+          map['destinationAddress'] ?? map['destination_location'],
       startLatitude: (map['startLatitude'] as num?)?.toDouble(),
       startLongitude: (map['startLongitude'] as num?)?.toDouble(),
-      destLatitude: (map['destLatitude'] ?? map['dest_latitude'] as num?)?.toDouble(),
-      destLongitude: (map['destLongitude'] ?? map['dest_longitude'] as num?)?.toDouble(),
-      startTime: map['startTime'] != null
-          ? DateTime.tryParse(map['startTime'].toString()) ?? DateTime.now()
+      destLatitude: (map['destLatitude'] ?? map['dest_latitude'] as num?)
+          ?.toDouble(),
+      destLongitude: (map['destLongitude'] ?? map['dest_longitude'] as num?)
+          ?.toDouble(),
+      startTime: (map['startTime'] ?? map['start_time']) != null
+          ? DateTime.tryParse(
+                  (map['startTime'] ?? map['start_time']).toString(),
+                ) ??
+                DateTime.now()
           : DateTime.now(),
-      endTime: map['endTime'] != null
-          ? DateTime.tryParse(map['endTime'].toString())
+      endTime: (map['endTime'] ?? map['end_time']) != null
+          ? DateTime.tryParse((map['endTime'] ?? map['end_time']).toString())
           : null,
-      distanceKm: (map['distanceKm'] as num?)?.toDouble(),
-      status: map['status'] ?? 'COMPLETED',
-      sleepModeEnabled: map['sleepModeEnabled'] == 1 || map['sleepModeEnabled'] == true,
+      distanceKm: (map['distanceKm'] ?? map['distance_travelled'] as num?)
+          ?.toDouble(),
+      status:
+          (map['status'] ?? map['journey_status'])?.toString() ?? 'COMPLETED',
+      sleepModeEnabled:
+          map['sleepModeEnabled'] == 1 ||
+          map['sleepModeEnabled'] == true ||
+          map['sleep_mode_enabled'] == 1,
     );
   }
 

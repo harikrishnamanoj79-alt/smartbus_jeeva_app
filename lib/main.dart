@@ -7,9 +7,11 @@ import 'screens/login_screen.dart';
 import 'services/api_service.dart';
 import 'services/journey_service.dart';
 import 'services/theme_service.dart';
+import 'services/background_tracking_service.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await BackgroundTrackingService.instance.initialize();
   unawaited(AppThemeService.instance.load());
   runApp(const SmartBusGuardian());
 }

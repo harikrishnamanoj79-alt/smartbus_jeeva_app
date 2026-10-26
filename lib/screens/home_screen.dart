@@ -7,6 +7,7 @@ import 'sleep_mode_screen.dart';
 import 'profile_screen.dart';
 import 'notifications_screen.dart';
 import '../services/journey_service.dart';
+import '../services/saved_destination_service.dart';
 import '../services/theme_service.dart';
 import '../services/auth_service.dart';
 
@@ -34,6 +35,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   String? userName;
   int? userId;
+  List<Map<String, dynamic>> savedDestinations = [];
 
   int _navIndex = 0;
 
@@ -50,7 +52,9 @@ class _HomeScreenState extends State<HomeScreen> {
     if (mounted) {
       setState(() {
         if (user != null) {
-          var rawName = (user['username'] ?? user['name'] ?? user['full_name'])?.toString().trim();
+          var rawName = (user['username'] ?? user['name'] ?? user['full_name'])
+              ?.toString()
+              .trim();
           // Treat placeholder "Passenger" as missing name
           if (rawName != null && rawName.toLowerCase() == 'passenger') {
             userName = null;
@@ -59,7 +63,7 @@ class _HomeScreenState extends State<HomeScreen> {
           }
           userId = user['id'] is int
               ? user['id'] as int
-              : int.tryParse(user['id']?.toString() ?? '1') ?? 1;
+              : int.tryParse(user['id']?.toString() ?? '');
         }
         if (active != null && active.status == 'IN_PROGRESS') {
           journeyActive = true;
@@ -70,6 +74,24 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       });
     }
+    await _loadSavedDestinations();
+  }
+
+  Future<void> _loadSavedDestinations() async {
+    final user = await AuthService.instance.getCurrentUser();
+    final rawId = user?['id'];
+    final currentUserId = rawId is int
+        ? rawId
+        : int.tryParse(rawId?.toString() ?? '');
+    if (currentUserId == null) {
+      if (mounted) setState(() => savedDestinations = []);
+      return;
+    }
+    final destinations = await SavedDestinationService.instance.load(
+      userId: currentUserId,
+      syncWithBackend: user?['backend_synced'] == true,
+    );
+    if (mounted) setState(() => savedDestinations = destinations);
   }
 
   @override
@@ -535,12 +557,7 @@ class _HomeScreenState extends State<HomeScreen> {
               Expanded(
                 child: OutlinedButton(
                   onPressed: () async {
-                    await JourneyService.instance.endJourney(
-                      completed: true,
-                      finalDistanceKm: activeRemainingMeters != null
-                          ? activeRemainingMeters! / 1000
-                          : 5.0,
-                    );
+                    await JourneyService.instance.endJourney(completed: true);
 
                     if (mounted) {
                       setState(() {
@@ -868,50 +885,66 @@ class _HomeScreenState extends State<HomeScreen> {
 
       child: Column(
         children: [
-          const Icon(
-            Icons.location_on_outlined,
-            size: 40,
-            color: kPrimaryPurple,
-          ),
-
-          const SizedBox(height: 10),
-
-          const Text(
-            'No saved destinations',
-            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-          ),
-
-          const SizedBox(height: 5),
-
-          Text(
-            'Your saved destinations will appear here.',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: 12,
-              color: AppThemeService.instance.secondaryText,
+          if (savedDestinations.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 14),
+              child: Text(
+                'No saved destinations yet.',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: AppThemeService.instance.secondaryText,
+                ),
+              ),
+            )
+          else
+            ...savedDestinations.map(
+              (destination) => ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(
+                  Icons.location_on_outlined,
+                  color: kPrimaryPurple,
+                ),
+                title: Text(destination['name'].toString()),
+                subtitle: Text(
+                  '${destination['latitude']}, ${destination['longitude']}',
+                ),
+                trailing: IconButton(
+                  tooltip: 'Remove saved destination',
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () async {
+                    final user = await AuthService.instance.getCurrentUser();
+                    final rawId = user?['id'];
+                    final currentUserId = rawId is int
+                        ? rawId
+                        : int.tryParse(rawId?.toString() ?? '');
+                    if (currentUserId == null) return;
+                    await SavedDestinationService.instance.remove(
+                      userId: currentUserId,
+                      destination: destination,
+                      syncWithBackend: user?['backend_synced'] == true,
+                    );
+                    await _loadSavedDestinations();
+                  },
+                ),
+              ),
             ),
-          ),
-
-          const SizedBox(height: 14),
-
           OutlinedButton.icon(
             onPressed: () async {
               await Navigator.push(
                 context,
-
                 MaterialPageRoute(builder: (_) => const DestinationScreen()),
               );
+              await _loadSavedDestinations();
             },
-
             icon: const Icon(Icons.add_location_alt_outlined),
-
-            label: const Text('Add Destination'),
-
+            label: Text(
+              savedDestinations.isEmpty
+                  ? 'Add Destination'
+                  : 'Manage Destinations',
+            ),
             style: OutlinedButton.styleFrom(
               foregroundColor: kPrimaryPurple,
-
               side: const BorderSide(color: kPrimaryPurple),
-
               shape: RoundedRectangleBorder(
                 borderRadius: BorderRadius.circular(12),
               ),

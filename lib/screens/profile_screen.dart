@@ -351,6 +351,13 @@ class _ProfileScreenState extends State<ProfileScreen> {
           ),
           const _MenuDivider(),
           _MenuRow(
+            icon: Icons.lock_outline,
+            title: 'Change Password',
+            subtitle: 'Update your account password',
+            onTap: _changePassword,
+          ),
+          const _MenuDivider(),
+          _MenuRow(
             icon: Icons.bookmark_border,
             title: 'Saved Destinations',
             subtitle: 'Manage home, office & transit stops',
@@ -470,15 +477,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
       context,
       MaterialPageRoute(builder: (_) => const SettingsScreen()),
     );
-  }
-
-  String _getInitials(String? name) {
-    if (name == null || name.trim().isEmpty) return '?';
-    final parts = name.trim().split(RegExp(r'\s+'));
-    if (parts.length > 1) {
-      return '${parts.first[0]}${parts[1][0]}'.toUpperCase();
-    }
-    return parts.first[0].toUpperCase();
   }
 
   Future<void> _editProfile() async {

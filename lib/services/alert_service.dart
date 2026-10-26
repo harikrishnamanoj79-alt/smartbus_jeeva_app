@@ -5,6 +5,7 @@ import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vibration/vibration.dart';
+import 'api_service.dart';
 
 class AppNotification {
   final String id;
@@ -202,12 +203,56 @@ class AlertService {
   Future<void> fireDestinationAlert({
     required String destinationName,
     required double distanceMeters,
+    int? journeyId,
   }) async {
     final message =
         'Approaching $destinationName. About ${distanceMeters.toStringAsFixed(0)} meters remaining.';
     await _vibrateOnce();
     await _speak(message);
     await _showNotification(title: 'Destination Approaching', body: message);
+    if (journeyId != null) {
+      await Future.wait([
+        ApiService.recordJourneyAlert(
+          journeyId: journeyId,
+          alertType: 'VOICE',
+          distanceRemainingMeters: distanceMeters,
+        ),
+        ApiService.recordJourneyAlert(
+          journeyId: journeyId,
+          alertType: 'VIBRATION',
+          distanceRemainingMeters: distanceMeters,
+        ),
+        ApiService.recordJourneyAlert(
+          journeyId: journeyId,
+          alertType: 'SCREEN',
+          distanceRemainingMeters: distanceMeters,
+        ),
+      ]);
+    }
+  }
+
+  Future<void> fireMissedStopAlert({
+    required String destinationName,
+    required String? nearestStopName,
+    required double distanceMeters,
+    int? journeyId,
+  }) async {
+    final returnGuidance = nearestStopName == null
+        ? 'Find a nearby stop and ask for return directions.'
+        : 'Nearest return stop: $nearestStopName.';
+    final message =
+        'You may have passed $destinationName. You are now about '
+        '${distanceMeters.toStringAsFixed(0)} meters away. $returnGuidance';
+    await _vibrateOnce();
+    await _speak(message);
+    await _showNotification(title: 'Destination May Have Been Missed', body: message);
+    if (journeyId != null) {
+      await ApiService.recordJourneyAlert(
+        journeyId: journeyId,
+        alertType: 'ALARM',
+        distanceRemainingMeters: distanceMeters,
+      );
+    }
   }
 
   /// Sleep Protection Module: fires the same alert immediately, then keeps
@@ -218,6 +263,7 @@ class AlertService {
   void startSleepAlarm({
     required String destinationName,
     Duration interval = const Duration(seconds: 12),
+    int? journeyId,
   }) {
     stopRepeatingAlert();
     final message = 'Wake up! Approaching $destinationName. Please get ready.';
@@ -229,6 +275,25 @@ class AlertService {
         title: 'Wake Up — Destination Approaching',
         body: message,
       );
+      if (journeyId != null) {
+        await Future.wait([
+          ApiService.recordJourneyAlert(
+            journeyId: journeyId,
+            alertType: 'VOICE',
+            distanceRemainingMeters: 0,
+          ),
+          ApiService.recordJourneyAlert(
+            journeyId: journeyId,
+            alertType: 'VIBRATION',
+            distanceRemainingMeters: 0,
+          ),
+          ApiService.recordJourneyAlert(
+            journeyId: journeyId,
+            alertType: 'ALARM',
+            distanceRemainingMeters: 0,
+          ),
+        ]);
+      }
     }
 
     fireOnce();

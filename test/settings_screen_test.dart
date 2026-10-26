@@ -39,7 +39,15 @@ void main() {
 
     await tester.tap(find.byTooltip('Back'));
     await tester.pumpAndSettle();
-    expect(find.text('Passenger Profile'), findsOneWidget);
+    expect(
+      find.byWidgetPredicate(
+        (widget) =>
+            widget is Text &&
+            widget.data == 'Profile' &&
+            widget.style?.fontSize == 25,
+      ),
+      findsOneWidget,
+    );
 
     await themes.setThemeMode(ThemeMode.system);
   });

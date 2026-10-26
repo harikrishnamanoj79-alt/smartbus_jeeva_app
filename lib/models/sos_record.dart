@@ -12,7 +12,7 @@ class SosRecord {
 
   SosRecord({
     this.id,
-    this.userId = 1,
+    required this.userId,
     this.journeyId,
     required this.latitude,
     required this.longitude,
@@ -37,15 +37,15 @@ class SosRecord {
   factory SosRecord.fromMap(Map<String, dynamic> map) {
     return SosRecord(
       id: map['id'] ?? map['sos_id'],
-      userId: map['userId'] ?? map['user_id'] ?? 1,
+      userId: map['userId'] ?? map['user_id'] ?? 0,
       journeyId: map['journeyId'] ?? map['journey_id'],
       latitude: (map['latitude'] as num?)?.toDouble() ?? 0.0,
       longitude: (map['longitude'] as num?)?.toDouble() ?? 0.0,
       timestamp: map['timestamp'] != null
           ? DateTime.tryParse(map['timestamp'].toString()) ?? DateTime.now()
           : map['sent_at'] != null
-              ? DateTime.tryParse(map['sent_at'].toString()) ?? DateTime.now()
-              : DateTime.now(),
+          ? DateTime.tryParse(map['sent_at'].toString()) ?? DateTime.now()
+          : DateTime.now(),
       status: map['status'] ?? 'SENT',
       address: map['address'],
     );

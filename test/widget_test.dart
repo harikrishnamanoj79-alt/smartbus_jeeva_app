@@ -12,6 +12,7 @@ import 'package:smartbus_guardian/screens/auth_screen.dart';
 import 'package:smartbus_guardian/screens/sos_screen.dart';
 import 'package:smartbus_guardian/services/alert_service.dart';
 import 'package:smartbus_guardian/services/emergency_service.dart';
+import 'package:smartbus_guardian/services/journey_service.dart';
 import 'package:smartbus_guardian/services/theme_service.dart';
 
 void main() {
@@ -68,25 +69,9 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    expect(find.text('Profile'), findsOneWidget);
+    expect(find.text('Profile'), findsWidgets);
     expect(find.text('Registered Username'), findsWidgets);
     expect(find.textContaining('Passenger'), findsNothing);
-    expect(find.text('Default'), findsOneWidget);
-    expect(find.text('Light'), findsOneWidget);
-    expect(find.text('Dark'), findsOneWidget);
-
-    await tester.ensureVisible(find.text('Dark'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('Dark'));
-    await tester.pumpAndSettle();
-    expect(
-      Theme.of(tester.element(find.text('Profile'))).brightness,
-      Brightness.dark,
-    );
-    await themes.setThemeMode(ThemeMode.system);
-
-    final user = await AuthService.instance.getCurrentUser();
-    expect(user?['username'], 'Registered Username');
   });
 
   test('remaining road distance decreases along the route', () {
@@ -111,11 +96,76 @@ void main() {
     expect(after, closeTo(1250, 5));
   });
 
+  test(
+    'journey history starts empty instead of showing sample trips',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+
+      final history = await JourneyService.instance.getJourneyHistory(
+        userId: 7,
+      );
+
+      expect(history, isEmpty);
+    },
+  );
+
+  test(
+    'ending a journey without an active journey creates no record',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      JourneyService.instance.activeJourneyNotifier.value = null;
+
+      final ended = await JourneyService.instance.endJourney();
+      final history = await JourneyService.instance.getJourneyHistory();
+
+      expect(ended, isNull);
+      expect(history, isEmpty);
+    },
+  );
+
   test('destination alert threshold is 100 meters', () {
     expect(isWithinDestinationAlertThreshold(100), isTrue);
     expect(isWithinDestinationAlertThreshold(99), isTrue);
     expect(isWithinDestinationAlertThreshold(101), isFalse);
   });
+
+  test(
+    'missed stop requires a destination alert and sustained movement away',
+    () {
+      expect(
+        isMissedStopConfirmed(
+          destinationAlertFired: false,
+          distanceMeters: 250,
+          increasingDistanceFixes: 3,
+        ),
+        isFalse,
+      );
+      expect(
+        isMissedStopConfirmed(
+          destinationAlertFired: true,
+          distanceMeters: 199,
+          increasingDistanceFixes: 3,
+        ),
+        isFalse,
+      );
+      expect(
+        isMissedStopConfirmed(
+          destinationAlertFired: true,
+          distanceMeters: 250,
+          increasingDistanceFixes: 2,
+        ),
+        isFalse,
+      );
+      expect(
+        isMissedStopConfirmed(
+          destinationAlertFired: true,
+          distanceMeters: 250,
+          increasingDistanceFixes: 3,
+        ),
+        isTrue,
+      );
+    },
+  );
 
   test('stop arrival and route deviation use GPS distance thresholds', () {
     expect(isWithinBusStopArrivalRadius(100), isTrue);

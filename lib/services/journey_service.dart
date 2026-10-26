@@ -22,7 +22,7 @@ class JourneyService {
 
   /// Starts a new journey and saves it as active
   Future<JourneyRecord> startJourney({
-    int userId = 1,
+    required int userId,
     String sourceLocation = 'Current Location',
     required String destinationName,
     String? destinationAddress,
@@ -32,10 +32,11 @@ class JourneyService {
     double? destLongitude,
     double? estimatedDistanceKm,
     bool sleepModeEnabled = false,
+    bool syncWithBackend = true,
   }) async {
     final journeyId = 'JRN_${DateTime.now().millisecondsSinceEpoch}';
 
-    final journey = JourneyRecord(
+    var journey = JourneyRecord(
       id: journeyId,
       userId: userId,
       sourceLocation: sourceLocation,
@@ -56,19 +57,26 @@ class JourneyService {
     await prefs.setString(_activeJourneyKey, journey.toJson());
     activeJourneyNotifier.value = journey;
 
-    // Sync with backend in background
-    if (destLatitude != null && destLongitude != null) {
-      ApiService.startJourney(
+    if (syncWithBackend && destLatitude != null && destLongitude != null) {
+      final result = await ApiService.startJourney(
         userId: userId,
         sourceLocation: sourceLocation,
         destinationLocation: destinationName,
         destinationLatitude: destLatitude,
         destinationLongitude: destLongitude,
         sleepModeEnabled: sleepModeEnabled,
-      ).catchError((e) {
-        debugPrint('Backend start journey fallback: $e');
-        return {'success': false};
-      });
+      );
+      final backendId = int.tryParse(result['journey_id']?.toString() ?? '');
+      if (result['success'] == true && backendId != null) {
+        journey = journey.copyWith(backendId: backendId);
+        await prefs.setString(_activeJourneyKey, journey.toJson());
+        activeJourneyNotifier.value = journey;
+      } else {
+        debugPrint(
+          'Backend journey start was not completed: '
+          '${result['error'] ?? result['message'] ?? 'invalid response'}',
+        );
+      }
     }
 
     return journey;
@@ -76,34 +84,43 @@ class JourneyService {
 
   /// Ends the active journey (or specified journey) and archives it in history
   Future<JourneyRecord?> endJourney({
-    String? journeyId,
     bool completed = true,
+    bool missed = false,
     double? finalDistanceKm,
   }) async {
     final prefs = await SharedPreferences.getInstance();
-    JourneyRecord? current = activeJourneyNotifier.value ?? await getActiveJourney();
+    JourneyRecord? current =
+        activeJourneyNotifier.value ?? await getActiveJourney();
 
-    if (current == null) {
-      // If no active journey in memory, create a fallback record so nothing is lost
-      final now = DateTime.now();
-      current = JourneyRecord(
-        id: journeyId ?? 'JRN_${now.millisecondsSinceEpoch}',
-        destinationName: 'Destination Stop',
-        startTime: now.subtract(const Duration(minutes: 15)),
-        endTime: now,
-        status: completed ? 'COMPLETED' : 'CANCELLED',
-        distanceKm: finalDistanceKm ?? 5.2,
-      );
-    }
+    if (current == null) return null;
 
     final finishedJourney = current.copyWith(
       endTime: DateTime.now(),
-      status: completed ? 'COMPLETED' : 'CANCELLED',
-      distanceKm: finalDistanceKm ?? current.distanceKm ?? 4.5,
+      status: completed
+          ? 'COMPLETED'
+          : missed
+          ? 'MISSED'
+          : 'CANCELLED',
+      distanceKm: finalDistanceKm ?? current.distanceKm,
     );
 
+    if ((completed || missed) && current.backendId != null) {
+      final result = await ApiService.finishJourney(
+        journeyId: current.backendId!,
+        userId: current.userId,
+        distanceTravelledKm: finishedJourney.distanceKm ?? 0,
+        status: missed ? 'MISSED' : 'COMPLETED',
+      );
+      if (result['success'] != true) {
+        debugPrint(
+          'Backend journey completion failed: '
+          '${result['error'] ?? result['message'] ?? 'invalid response'}',
+        );
+      }
+    }
+
     // Add to history list
-    final history = await getJourneyHistory(userId: current.userId);
+    final history = await _loadStoredHistory();
     history.insert(0, finishedJourney);
     await _saveHistoryList(history);
 
@@ -112,6 +129,31 @@ class JourneyService {
     activeJourneyNotifier.value = null;
 
     return finishedJourney;
+  }
+
+  Future<bool> recordMissedStop({
+    required double latitude,
+    required double longitude,
+    required String nearestReturnStop,
+  }) async {
+    final current = activeJourneyNotifier.value ?? await getActiveJourney();
+    if (current?.backendId == null) {
+      debugPrint('Missed stop was not synced: no backend journey is active.');
+      return false;
+    }
+    final result = await ApiService.recordMissedStop(
+      journeyId: current!.backendId!,
+      latitude: latitude,
+      longitude: longitude,
+      nearestReturnStop: nearestReturnStop,
+    );
+    if (result['success'] != true) {
+      debugPrint(
+        'Missed-stop record failed: '
+        '${result['error'] ?? result['message'] ?? 'invalid response'}',
+      );
+    }
+    return result['success'] == true;
   }
 
   /// Get currently active ongoing journey
@@ -129,68 +171,27 @@ class JourneyService {
   }
 
   /// Get list of all saved journeys
-  Future<List<JourneyRecord>> getJourneyHistory({int? userId}) async {
-    final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_historyKey);
-    List<JourneyRecord> list = [];
+  Future<List<JourneyRecord>> getJourneyHistory({
+    int? userId,
+    bool syncWithBackend = false,
+  }) async {
+    final stored = await _loadStoredHistory();
+    final local = userId == null
+        ? stored
+        : stored.where((journey) => journey.userId == userId).toList();
+    if (userId == null || !syncWithBackend) return local;
 
-    if (raw != null && raw.isNotEmpty) {
-      try {
-        final decoded = jsonDecode(raw) as List<dynamic>;
-        list = decoded
-            .map((item) =>
-                JourneyRecord.fromMap(item as Map<String, dynamic>))
-            .toList();
-      } catch (e) {
-        debugPrint('Error parsing journey history: $e');
-      }
-    }
-
-    // If list is empty, supply initial mock data so user sees rich demonstration
-    if (list.isEmpty) {
-      final now = DateTime.now();
-      list = [
-        JourneyRecord(
-          id: 'JRN_DEMO_1',
-          userId: userId ?? 1,
-          sourceLocation: 'Kottayam Central Bus Station',
-          destinationName: 'St. Joseph College, Palai',
-          destinationAddress: 'Main Gate, Palai Bypass Rd',
-          startTime: now.subtract(const Duration(days: 1, hours: 2, minutes: 40)),
-          endTime: now.subtract(const Duration(days: 1, hours: 2)),
-          distanceKm: 28.4,
-          status: 'COMPLETED',
-          sleepModeEnabled: true,
-        ),
-        JourneyRecord(
-          id: 'JRN_DEMO_2',
-          userId: userId ?? 1,
-          sourceLocation: 'Vadayar Junction',
-          destinationName: 'KSRTC Bus Terminal, Kottayam',
-          destinationAddress: 'Kottayam Town',
-          startTime: now.subtract(const Duration(days: 3, hours: 5)),
-          endTime: now.subtract(const Duration(days: 3, hours: 4, minutes: 20)),
-          distanceKm: 22.1,
-          status: 'COMPLETED',
-          sleepModeEnabled: false,
-        ),
-        JourneyRecord(
-          id: 'JRN_DEMO_3',
-          userId: userId ?? 1,
-          sourceLocation: 'Palai Bus Stand',
-          destinationName: 'Ramapuram Bus Stop',
-          destinationAddress: 'Ramapuram Junction',
-          startTime: now.subtract(const Duration(days: 5, hours: 8)),
-          endTime: now.subtract(const Duration(days: 5, hours: 7, minutes: 45)),
-          distanceKm: 7.8,
-          status: 'COMPLETED',
-          sleepModeEnabled: true,
-        ),
-      ];
-      await _saveHistoryList(list);
-    }
-
-    return list;
+    final backendRows = await ApiService.getJourneyHistory(userId);
+    final remote = backendRows.map(JourneyRecord.fromMap).toList();
+    final remoteIds = remote.map((journey) => journey.backendId).toSet();
+    final combined = [
+      ...remote,
+      ...local.where(
+        (journey) =>
+            journey.backendId == null || !remoteIds.contains(journey.backendId),
+      ),
+    ]..sort((first, second) => second.startTime.compareTo(first.startTime));
+    return combined;
   }
 
   Future<void> _saveHistoryList(List<JourneyRecord> list) async {
@@ -200,15 +201,76 @@ class JourneyService {
   }
 
   /// Deletes a specific journey from history
-  Future<void> deleteJourney(String id) async {
-    final history = await getJourneyHistory();
-    history.removeWhere((j) => j.id == id);
+  Future<void> deleteJourney(
+    String id, {
+    int? userId,
+    bool syncWithBackend = false,
+  }) async {
+    final history = await _loadStoredHistory();
+    final removed = history
+        .where(
+          (journey) =>
+              journey.id == id && (userId == null || journey.userId == userId),
+        )
+        .toList();
+    history.removeWhere(
+      (journey) =>
+          journey.id == id && (userId == null || journey.userId == userId),
+    );
     await _saveHistoryList(history);
+    int? backendId;
+    for (final journey in removed) {
+      if (journey.backendId != null) {
+        backendId = journey.backendId;
+        break;
+      }
+    }
+    if (syncWithBackend && userId != null && backendId != null) {
+      final deleted = await ApiService.deleteJourneyHistory(
+        userId: userId,
+        journeyId: backendId,
+      );
+      if (!deleted) {
+        debugPrint('The journey was removed locally but not on the backend.');
+      }
+    }
   }
 
   /// Clears all journey history
-  Future<void> clearAllHistory() async {
+  Future<void> clearAllHistory({
+    int? userId,
+    bool syncWithBackend = false,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_historyKey);
+    if (userId == null) {
+      await prefs.remove(_historyKey);
+      return;
+    }
+    final history = await _loadStoredHistory();
+    history.removeWhere((journey) => journey.userId == userId);
+    await _saveHistoryList(history);
+    if (syncWithBackend) {
+      final cleared = await ApiService.clearJourneyHistory(userId);
+      if (!cleared) {
+        debugPrint(
+          'Journey history was cleared locally but not on the backend.',
+        );
+      }
+    }
+  }
+
+  Future<List<JourneyRecord>> _loadStoredHistory() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_historyKey);
+    if (raw == null || raw.isEmpty) return [];
+    try {
+      final decoded = jsonDecode(raw) as List<dynamic>;
+      return decoded
+          .map((item) => JourneyRecord.fromMap(item as Map<String, dynamic>))
+          .toList();
+    } catch (error) {
+      debugPrint('Error parsing journey history: $error');
+      return [];
+    }
   }
 }

@@ -20,8 +20,7 @@ Uri buildSosSmsUri(
   final recipients = phoneNumbers
       .map((phone) => phone.replaceAll(RegExp(r'[^0-9+]'), ''))
       .where(
-        (phone) =>
-            phone.isNotEmpty && !isEmergencyHelplinePhoneNumber(phone),
+        (phone) => phone.isNotEmpty && !isEmergencyHelplinePhoneNumber(phone),
       )
       .toList();
   final separator = (platform ?? defaultTargetPlatform) == TargetPlatform.iOS
@@ -54,6 +53,8 @@ class EmergencyService {
 
   static const String _contactsStorageKey = 'smartbus_emergency_contacts_v2';
   static const String _historyStorageKey = 'smartbus_sos_history_v2';
+  String _historyStorageKeyForUser(int userId) =>
+      '${_historyStorageKey}_$userId';
 
   final FlutterTts _tts = FlutterTts();
   Timer? _sirenTimer;
@@ -72,6 +73,7 @@ class EmergencyService {
   static final List<EmergencyContact> defaultHelplines = [
     EmergencyContact(
       id: 101,
+      userId: 0,
       name: 'National Emergency',
       phone: '112',
       relationship: 'All-in-One Helpline',
@@ -79,6 +81,7 @@ class EmergencyService {
     ),
     EmergencyContact(
       id: 102,
+      userId: 0,
       name: 'Police Control Room',
       phone: '100',
       relationship: 'Police',
@@ -86,6 +89,7 @@ class EmergencyService {
     ),
     EmergencyContact(
       id: 103,
+      userId: 0,
       name: 'Women Helpline',
       phone: '1091',
       relationship: 'Women Safety',
@@ -93,6 +97,7 @@ class EmergencyService {
     ),
     EmergencyContact(
       id: 104,
+      userId: 0,
       name: 'Ambulance Service',
       phone: '108',
       relationship: 'Medical Emergency',
@@ -113,9 +118,12 @@ class EmergencyService {
   // CONTACTS MANAGEMENT
   // ============================================================
 
-  Future<List<EmergencyContact>> loadContacts({int userId = 1}) async {
+  Future<List<EmergencyContact>> loadContacts({required int userId}) async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString(_contactsStorageKey);
+    final userStorageKey = '$_contactsStorageKey$userId';
+    var raw = prefs.getString(userStorageKey);
+    final migrateLegacy = raw == null;
+    raw ??= prefs.getString(_contactsStorageKey);
     List<EmergencyContact> list = [];
 
     if (raw != null && raw.isNotEmpty) {
@@ -125,21 +133,41 @@ class EmergencyService {
             .map(
               (item) => EmergencyContact.fromMap(item as Map<String, dynamic>),
             )
+            .where((contact) => contact.userId == userId)
             .toList();
       } catch (e) {
         debugPrint('Error decoding emergency contacts: $e');
       }
     }
 
+    if (migrateLegacy && list.isNotEmpty) {
+      await prefs.setString(
+        userStorageKey,
+        jsonEncode(list.map((contact) => contact.toMap()).toList()),
+      );
+    }
     return list;
   }
 
-  Future<void> saveContacts(List<EmergencyContact> contacts) async {
+  Future<void> saveContacts(
+    List<EmergencyContact> contacts, {
+    int? userId,
+  }) async {
     final prefs = await SharedPreferences.getInstance();
-    final encoded = jsonEncode(
-      contacts.map((contact) => contact.toMap()).toList(),
-    );
-    await prefs.setString(_contactsStorageKey, encoded);
+    if (contacts.isEmpty && userId != null) {
+      await prefs.setString('$_contactsStorageKey$userId', '[]');
+      return;
+    }
+    final grouped = <int, List<EmergencyContact>>{};
+    for (final contact in contacts) {
+      grouped.putIfAbsent(contact.userId, () => []).add(contact);
+    }
+    for (final entry in grouped.entries) {
+      await prefs.setString(
+        '$_contactsStorageKey${entry.key}',
+        jsonEncode(entry.value.map((contact) => contact.toMap()).toList()),
+      );
+    }
   }
 
   Future<void> addContact(EmergencyContact contact) async {
@@ -156,30 +184,56 @@ class EmergencyService {
     final newContact = EmergencyContact(
       id: contact.id ?? newId,
       userId: contact.userId,
+      backendId: contact.backendId,
       name: contact.name,
       phone: contact.phone,
       relationship: contact.relationship,
       isDefault: contact.isDefault,
     );
     list.insert(0, newContact);
-    await saveContacts(list);
+    await saveContacts(list, userId: contact.userId);
 
-    // Sync with backend if online (fire and forget)
-    ApiService.addEmergencyContact(
+    // Keep the backend contact ID so later deletions target the right record.
+    final result = await ApiService.addEmergencyContact(
       userId: contact.userId,
       name: contact.name,
       phone: contact.phone,
       relationship: contact.relationship,
-    ).catchError((_) => {'success': false});
+    );
+    final backendId = int.tryParse(result['contact_id']?.toString() ?? '');
+    if (result['success'] == true && backendId != null) {
+      final saved = EmergencyContact(
+        id: newContact.id,
+        backendId: backendId,
+        userId: newContact.userId,
+        name: newContact.name,
+        phone: newContact.phone,
+        relationship: newContact.relationship,
+        isDefault: newContact.isDefault,
+      );
+      list[0] = saved;
+      await saveContacts(list, userId: contact.userId);
+    } else {
+      debugPrint(
+        'Emergency contact was saved locally only: '
+        '${result['error'] ?? result['message'] ?? 'backend unavailable'}',
+      );
+    }
   }
 
-  Future<void> deleteContact(int contactId) async {
-    final list = await loadContacts();
-    list.removeWhere((c) => c.id == contactId);
-    await saveContacts(list);
+  Future<void> deleteContact(EmergencyContact contact) async {
+    final list = await loadContacts(userId: contact.userId);
+    list.removeWhere((saved) => saved.id == contact.id);
+    await saveContacts(list, userId: contact.userId);
 
-    // Sync deletion with backend
-    ApiService.deleteEmergencyContact(contactId).catchError((_) => false);
+    if (contact.backendId != null) {
+      final deleted = await ApiService.deleteEmergencyContact(
+        contact.backendId!,
+      );
+      if (!deleted) {
+        debugPrint('Emergency contact deletion failed on backend.');
+      }
+    }
   }
 
   // ============================================================
@@ -361,9 +415,7 @@ class EmergencyService {
   }) async {
     final phoneNumbers = contacts
         .map((c) => c.phone.replaceAll(RegExp(r'[^0-9+]'), ''))
-        .where(
-          (p) => p.isNotEmpty && !isEmergencyHelplinePhoneNumber(p),
-        )
+        .where((p) => p.isNotEmpty && !isEmergencyHelplinePhoneNumber(p))
         .toList();
     if (phoneNumbers.isEmpty) return false;
 
@@ -377,7 +429,9 @@ class EmergencyService {
         return true;
       }
 
-      debugPrint('Backend SMS unavailable: ${result['error'] ?? result['message']}');
+      debugPrint(
+        'Backend SMS unavailable: ${result['error'] ?? result['message']}',
+      );
       return false;
     } catch (error) {
       debugPrint('Error sending SOS through backend: $error');
@@ -391,9 +445,7 @@ class EmergencyService {
   }) async {
     final phoneNumbers = contacts
         .map((c) => c.phone.replaceAll(RegExp(r'[^0-9+]'), ''))
-        .where(
-          (p) => p.isNotEmpty && !isEmergencyHelplinePhoneNumber(p),
-        )
+        .where((p) => p.isNotEmpty && !isEmergencyHelplinePhoneNumber(p))
         .toList();
     if (phoneNumbers.isEmpty) return false;
 
@@ -423,18 +475,21 @@ class EmergencyService {
   // ============================================================
 
   Future<SosRecord> triggerSos({
-    int userId = 1,
+    required int userId,
     int? journeyId,
     String? userName,
     Position? position,
+    bool backendEnabled = true,
   }) async {
     await init();
 
     // 1. Fetch current GPS position with quick fallback
     final pos = position ?? await getCurrentLocation();
-    final double lat =
-        pos?.latitude ?? 13.0827; // default fallback if GPS unavailable
-    final double lng = pos?.longitude ?? 80.2707;
+    if (pos == null) {
+      throw StateError('Current GPS location is unavailable.');
+    }
+    final double lat = pos.latitude;
+    final double lng = pos.longitude;
 
     final record = SosRecord(
       id: DateTime.now().millisecondsSinceEpoch % 1000000,
@@ -456,15 +511,22 @@ class EmergencyService {
     await _saveSosToHistory(record);
 
     // 3. Post to backend
-    try {
-      ApiService.sendSOS(
-        userId: userId,
-        journeyId: journeyId,
-        latitude: lat,
-        longitude: lng,
-      ).catchError((_) => {'success': false});
-    } catch (e) {
-      debugPrint('Error posting SOS to backend: $e');
+    if (backendEnabled) {
+      unawaited(
+        ApiService.sendSOS(
+          userId: userId,
+          journeyId: journeyId,
+          latitude: lat,
+          longitude: lng,
+        ).then((result) {
+          if (result['success'] != true) {
+            debugPrint(
+              'Backend SOS request failed: '
+              '${result['error'] ?? result['message'] ?? 'invalid response'}',
+            );
+          }
+        }),
+      );
     }
 
     // 4. Start Loud Audio Siren & Haptic Alert
@@ -476,7 +538,8 @@ class EmergencyService {
   Future<void> _saveSosToHistory(SosRecord record) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_historyStorageKey);
+      final storageKey = _historyStorageKeyForUser(record.userId);
+      final raw = prefs.getString(storageKey);
       List<SosRecord> list = [];
       if (raw != null && raw.isNotEmpty) {
         final decoded = jsonDecode(raw) as List<dynamic>;
@@ -489,7 +552,7 @@ class EmergencyService {
         list = list.sublist(0, 50);
       }
       await prefs.setString(
-        _historyStorageKey,
+        storageKey,
         jsonEncode(list.map((r) => r.toMap()).toList()),
       );
     } catch (e) {
@@ -497,15 +560,25 @@ class EmergencyService {
     }
   }
 
-  Future<List<SosRecord>> loadSosHistory({int userId = 1}) async {
+  Future<List<SosRecord>> loadSosHistory({required int userId}) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final raw = prefs.getString(_historyStorageKey);
+      final storageKey = _historyStorageKeyForUser(userId);
+      final raw =
+          prefs.getString(storageKey) ?? prefs.getString(_historyStorageKey);
       if (raw != null && raw.isNotEmpty) {
         final decoded = jsonDecode(raw) as List<dynamic>;
-        return decoded
+        final history = decoded
             .map((item) => SosRecord.fromMap(item as Map<String, dynamic>))
+            .where((record) => record.userId == userId)
             .toList();
+        if (prefs.getString(storageKey) == null) {
+          await prefs.setString(
+            storageKey,
+            jsonEncode(history.map((record) => record.toMap()).toList()),
+          );
+        }
+        return history;
       }
     } catch (e) {
       debugPrint('Error loading local SOS history: $e');

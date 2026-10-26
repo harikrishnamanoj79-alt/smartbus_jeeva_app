@@ -2,6 +2,7 @@ import 'dart:convert';
 
 class EmergencyContact {
   final int? id;
+  final int? backendId;
   final int userId;
   final String name;
   final String phone;
@@ -10,7 +11,8 @@ class EmergencyContact {
 
   EmergencyContact({
     this.id,
-    this.userId = 1,
+    this.backendId,
+    required this.userId,
     required this.name,
     required this.phone,
     this.relationship = 'Emergency Contact',
@@ -20,6 +22,7 @@ class EmergencyContact {
   Map<String, dynamic> toMap() {
     return {
       if (id != null) 'id': id,
+      if (backendId != null) 'backendId': backendId,
       'userId': userId,
       'name': name,
       'phone': phone,
@@ -31,7 +34,8 @@ class EmergencyContact {
   factory EmergencyContact.fromMap(Map<String, dynamic> map) {
     return EmergencyContact(
       id: map['id'] ?? map['contact_id'],
-      userId: map['userId'] ?? map['user_id'] ?? 1,
+      backendId: map['backendId'] ?? map['contact_id'],
+      userId: map['userId'] ?? map['user_id'] ?? 0,
       name: map['name'] ?? map['contact_name'] ?? '',
       phone: map['phone'] ?? map['contact_phone'] ?? '',
       relationship: map['relationship'] ?? 'Emergency Contact',

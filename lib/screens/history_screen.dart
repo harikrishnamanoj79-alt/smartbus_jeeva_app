@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../models/journey_record.dart';
+import '../services/auth_service.dart';
 import '../services/journey_service.dart';
 import '../services/theme_service.dart';
 import 'map_screen.dart';
@@ -22,6 +23,8 @@ class _HistoryScreenState extends State<HistoryScreen> {
   List<JourneyRecord> _allJourneys = [];
   bool _isLoading = true;
   String _selectedFilter = 'ALL'; // 'ALL', 'COMPLETED', 'CANCELLED'
+  int? _userId;
+  bool _syncWithBackend = false;
 
   @override
   void initState() {
@@ -31,7 +34,16 @@ class _HistoryScreenState extends State<HistoryScreen> {
 
   Future<void> _loadHistory() async {
     setState(() => _isLoading = true);
-    final list = await _journeyService.getJourneyHistory();
+    final user = await AuthService.instance.getCurrentUser();
+    final rawId = user?['id'];
+    _userId = rawId is int ? rawId : int.tryParse(rawId?.toString() ?? '');
+    _syncWithBackend = user?['backend_synced'] == true;
+    final list = _userId == null
+        ? <JourneyRecord>[]
+        : await _journeyService.getJourneyHistory(
+            userId: _userId,
+            syncWithBackend: _syncWithBackend,
+          );
     if (mounted) {
       setState(() {
         _allJourneys = list;
@@ -84,7 +96,11 @@ class _HistoryScreenState extends State<HistoryScreen> {
     );
 
     if (confirm == true) {
-      await _journeyService.deleteJourney(journey.id);
+      await _journeyService.deleteJourney(
+        journey.id,
+        userId: _userId,
+        syncWithBackend: _syncWithBackend,
+      );
       await _loadHistory();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
@@ -123,7 +139,10 @@ class _HistoryScreenState extends State<HistoryScreen> {
     );
 
     if (confirm == true) {
-      await _journeyService.clearAllHistory();
+      await _journeyService.clearAllHistory(
+        userId: _userId,
+        syncWithBackend: _syncWithBackend,
+      );
       await _loadHistory();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

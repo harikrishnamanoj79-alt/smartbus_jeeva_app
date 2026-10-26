@@ -29,9 +29,9 @@ String buildLocationShareMessage(double latitude, double longitude) {
 
 class SosScreen extends StatefulWidget {
   final int? journeyId;
-  final int userId;
+  final int? userId;
 
-  const SosScreen({super.key, this.journeyId, this.userId = 1});
+  const SosScreen({super.key, this.journeyId, this.userId});
 
   @override
   State<SosScreen> createState() => _SosScreenState();
@@ -50,6 +50,7 @@ class _SosScreenState extends State<SosScreen>
   String? _locationError;
 
   List<EmergencyContact> _contacts = [];
+  int? _userId;
   bool _isLoadingContacts = true;
 
   bool _isSosActive = false;
@@ -198,15 +199,25 @@ class _SosScreenState extends State<SosScreen>
     setState(() => _isLoadingContacts = true);
     try {
       final user = await AuthService.instance.getCurrentUser();
+      final rawId = user?['id'];
       final currentUid =
           uid ??
-          (user?['id'] is int
-              ? user!['id'] as int
-              : (int.tryParse(user?['id']?.toString() ?? '${widget.userId}') ??
-                    widget.userId));
+          widget.userId ??
+          (rawId is int ? rawId : int.tryParse(rawId?.toString() ?? ''));
+      if (currentUid == null) {
+        if (mounted) {
+          setState(() {
+            _userId = null;
+            _contacts = [];
+            _isLoadingContacts = false;
+          });
+        }
+        return;
+      }
       final list = await _emergencyService.loadContacts(userId: currentUid);
       if (mounted) {
         setState(() {
+          _userId = currentUid;
           _contacts = list;
           _isLoadingContacts = false;
         });
@@ -423,22 +434,47 @@ class _SosScreenState extends State<SosScreen>
 
   Future<void> _executeSosTrigger() async {
     final user = await AuthService.instance.getCurrentUser();
+    final rawUserId = user?['id'];
+    final uid = rawUserId is int
+        ? rawUserId
+        : int.tryParse(
+            rawUserId?.toString() ?? widget.userId?.toString() ?? '',
+          );
+    if (uid == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Log in before triggering an SOS.')),
+        );
+      }
+      return;
+    }
     final passengerName =
         (user?['username'] ?? user?['name'] ?? user?['full_name'])
             ?.toString() ??
         'Passenger';
-    final uid = user?['id'] is int
-        ? user!['id'] as int
-        : (int.tryParse(user?['id']?.toString() ?? '${widget.userId}') ??
-              widget.userId);
 
     final freshPosition = await _captureFreshGpsForSos();
-    final record = await _emergencyService.triggerSos(
-      userId: uid,
-      journeyId: widget.journeyId,
-      userName: passengerName,
-      position: freshPosition,
-    );
+    late final SosRecord record;
+    try {
+      record = await _emergencyService.triggerSos(
+        userId: uid,
+        journeyId: widget.journeyId,
+        userName: passengerName,
+        position: freshPosition,
+        backendEnabled: user?['backend_synced'] == true,
+      );
+    } on StateError catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${error.message} SOS location was not shared. Call emergency services if you need immediate help.',
+            ),
+          ),
+        );
+      }
+      return;
+    }
 
     if (!mounted) return;
 
@@ -866,9 +902,22 @@ class _SosScreenState extends State<SosScreen>
                         }
 
                         Navigator.pop(modalCtx);
+                        final contactUserId = _userId;
+                        if (contactUserId == null) {
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text(
+                                  'Log in to save emergency contacts.',
+                                ),
+                              ),
+                            );
+                          }
+                          return;
+                        }
 
                         final newContact = EmergencyContact(
-                          userId: widget.userId,
+                          userId: contactUserId,
                           name: name,
                           phone: phone,
                           relationship: selectedRelation,
@@ -934,7 +983,7 @@ class _SosScreenState extends State<SosScreen>
     );
 
     if (confirm == true && contact.id != null) {
-      await _emergencyService.deleteContact(contact.id!);
+      await _emergencyService.deleteContact(contact);
       await _loadContacts();
     }
   }
@@ -993,7 +1042,9 @@ class _SosScreenState extends State<SosScreen>
     if (position == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Current location is unavailable. Turn on GPS and retry.'),
+          content: Text(
+            'Current location is unavailable. Turn on GPS and retry.',
+          ),
         ),
       );
       return;
@@ -1037,7 +1088,9 @@ class _SosScreenState extends State<SosScreen>
     if (position == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('Current location is unavailable. Turn on GPS and retry.'),
+          content: Text(
+            'Current location is unavailable. Turn on GPS and retry.',
+          ),
         ),
       );
       return;
@@ -1722,7 +1775,7 @@ class _SosScreenState extends State<SosScreen>
               ),
             ),
             TextButton.icon(
-              onPressed: _showAddContactDialog,
+              onPressed: _userId == null ? null : _showAddContactDialog,
               icon: const Icon(Icons.add, size: 18),
               label: const Text('Add New'),
               style: TextButton.styleFrom(
@@ -1764,7 +1817,7 @@ class _SosScreenState extends State<SosScreen>
                   ),
                   const SizedBox(height: 10),
                   ElevatedButton(
-                    onPressed: _showAddContactDialog,
+                    onPressed: _userId == null ? null : _showAddContactDialog,
                     style: ElevatedButton.styleFrom(
                       backgroundColor: kPrimaryPurple,
                       foregroundColor: Colors.white,
@@ -1975,9 +2028,14 @@ class _SosScreenState extends State<SosScreen>
   // ============================================================
 
   void _showSosHistoryDialog() async {
-    final history = await _emergencyService.loadSosHistory(
-      userId: widget.userId,
-    );
+    final userId = _userId;
+    if (userId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Log in to view SOS history.')),
+      );
+      return;
+    }
+    final history = await _emergencyService.loadSosHistory(userId: userId);
 
     if (!mounted) return;
 

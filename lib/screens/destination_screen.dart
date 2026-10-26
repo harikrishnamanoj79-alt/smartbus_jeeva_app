@@ -6,6 +6,8 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 import 'login_screen.dart'; // for kPrimaryPurple, kBackground, kCardWhite
+import '../services/auth_service.dart';
+import '../services/saved_destination_service.dart';
 import '../services/theme_service.dart';
 
 class Destination {
@@ -16,6 +18,7 @@ class Destination {
   // When null, MapScreen falls back to manual tap-to-select.
   final double? latitude;
   final double? longitude;
+  final int? savedId;
 
   const Destination({
     required this.name,
@@ -23,6 +26,7 @@ class Destination {
     required this.icon,
     this.latitude,
     this.longitude,
+    this.savedId,
   });
 
   bool get hasCoordinates => latitude != null && longitude != null;
@@ -35,117 +39,10 @@ class JourneyPlan {
   const JourneyPlan({required this.origin, required this.destination});
 }
 
-const List<Destination> _savedDestinations = [
-  Destination(
-    name: 'Home',
-    subtitle: 'Vadayar',
-    icon: Icons.home_outlined,
-    latitude: 9.6952,
-    longitude: 76.6413,
-  ),
-  Destination(
-    name: 'College',
-    subtitle: "St. Joseph's, Palai",
-    icon: Icons.school_outlined,
-    latitude: 9.7095,
-    longitude: 76.6858,
-  ),
-  Destination(
-    name: 'Kottayam Town',
-    subtitle: 'KSRTC Bus Stand',
-    icon: Icons.location_city_outlined,
-    latitude: 9.5916,
-    longitude: 76.5222,
-  ),
-];
-
-const List<Destination> _nearbyStops = [
-  Destination(
-    name: 'Palai Bus Stand',
-    subtitle: 'Nearby bus stop',
-    icon: Icons.location_on_outlined,
-    latitude: 9.7099,
-    longitude: 76.6858,
-  ),
-  Destination(
-    name: 'Ramapuram Junction',
-    subtitle: 'Nearby bus stop',
-    icon: Icons.location_on_outlined,
-    latitude: 9.6382,
-    longitude: 76.7314,
-  ),
-  Destination(
-    name: 'Kanjirappally Stand',
-    subtitle: 'Nearby bus stop',
-    icon: Icons.location_on_outlined,
-    latitude: 9.5624,
-    longitude: 76.7889,
-  ),
-  Destination(
-    name: 'Erattupetta Town',
-    subtitle: 'Nearby bus stop',
-    icon: Icons.location_on_outlined,
-    latitude: 9.6875,
-    longitude: 76.7691,
-  ),
-];
-
-List<Destination> _sortPlacesFromLocation(
-  List<Destination> places,
-  LatLng location,
-) {
-  final sorted = [...places];
-  sorted.sort((first, second) {
-    final firstDistance = Geolocator.distanceBetween(
-      location.latitude,
-      location.longitude,
-      first.latitude!,
-      first.longitude!,
-    );
-    final secondDistance = Geolocator.distanceBetween(
-      location.latitude,
-      location.longitude,
-      second.latitude!,
-      second.longitude!,
-    );
-    return firstDistance.compareTo(secondDistance);
-  });
-
-  return sorted.map((place) {
-    final meters = Geolocator.distanceBetween(
-      location.latitude,
-      location.longitude,
-      place.latitude!,
-      place.longitude!,
-    );
-    return Destination(
-      name: place.name,
-      subtitle: meters < 1000
-          ? '${meters.round()} m away'
-          : '${(meters / 1000).toStringAsFixed(1)} km away',
-      icon: place.icon,
-      latitude: place.latitude,
-      longitude: place.longitude,
-    );
-  }).toList();
-}
-
 Future<List<Destination>> nearbyBusStopsAt(
   LatLng location, {
   int radiusMeters = 800,
 }) async {
-  final fallback = _sortPlacesFromLocation(_nearbyStops, location).where((
-    stop,
-  ) {
-    return Geolocator.distanceBetween(
-          location.latitude,
-          location.longitude,
-          stop.latitude!,
-          stop.longitude!,
-        ) <=
-        radiusMeters;
-  }).toList();
-
   final query =
       '[out:json][timeout:15];('
       'node(around:$radiusMeters,${location.latitude},${location.longitude})[highway=bus_stop];'
@@ -161,7 +58,7 @@ Future<List<Destination>> nearbyBusStopsAt(
     final response = await http
         .get(uri, headers: const {'User-Agent': 'SmartBusGuardian/1.0'})
         .timeout(const Duration(seconds: 12));
-    if (response.statusCode != 200) return fallback;
+    if (response.statusCode != 200) return [];
 
     final data = jsonDecode(response.body) as Map<String, dynamic>;
     final elements = data['elements'] as List<dynamic>? ?? [];
@@ -219,9 +116,9 @@ Future<List<Destination>> nearbyBusStopsAt(
       return firstDistance.compareTo(secondDistance);
     });
 
-    return stops.isEmpty ? fallback : stops.take(8).toList();
+    return stops.take(8).toList();
   } catch (_) {
-    return fallback;
+    return [];
   }
 }
 
@@ -277,14 +174,148 @@ class DestinationScreen extends StatefulWidget {
 
 class _DestinationScreenState extends State<DestinationScreen> {
   final _searchController = TextEditingController();
+  final List<Destination> _savedDestinations = [];
+  List<Destination> _nearbyStops = [];
   String _query = '';
   Destination? _selected;
-  Position? _currentPosition;
+  int? _userId;
+  bool _syncWithBackend = false;
 
   @override
   void initState() {
     super.initState();
-    _loadCurrentPosition();
+    unawaited(_loadSavedDestinations());
+    unawaited(_loadCurrentPosition());
+  }
+
+  Future<void> _loadSavedDestinations() async {
+    final user = await AuthService.instance.getCurrentUser();
+    final rawId = user?['id'];
+    _userId = rawId is int ? rawId : int.tryParse(rawId?.toString() ?? '');
+    _syncWithBackend = user?['backend_synced'] == true;
+    if (_userId == null) return;
+    final saved = await SavedDestinationService.instance.load(
+      userId: _userId!,
+      syncWithBackend: _syncWithBackend,
+    );
+    if (!mounted) return;
+    setState(() {
+      _savedDestinations
+        ..clear()
+        ..addAll(
+          saved.map(
+            (item) => Destination(
+              name: item['name'].toString(),
+              subtitle: 'Saved destination',
+              icon: Icons.bookmark_outline,
+              latitude: (item['latitude'] as num).toDouble(),
+              longitude: (item['longitude'] as num).toDouble(),
+              savedId: int.tryParse(item['destination_id']?.toString() ?? ''),
+            ),
+          ),
+        );
+    });
+  }
+
+  Future<void> _saveSelectedDestination() async {
+    final candidate =
+        _selected ??
+        (_query.trim().isEmpty
+            ? null
+            : Destination(
+                name: _query.trim(),
+                subtitle: 'Search result',
+                icon: Icons.bookmark_outline,
+              ));
+    if (candidate == null) {
+      _showMessage('Select or search for a destination to save.');
+      return;
+    }
+    if (_userId == null) {
+      _showMessage('Log in to save destinations.');
+      return;
+    }
+
+    try {
+      var latitude = candidate.latitude;
+      var longitude = candidate.longitude;
+      if (latitude == null || longitude == null) {
+        final uri = Uri.https('nominatim.openstreetmap.org', '/search', {
+          'q': candidate.name,
+          'format': 'jsonv2',
+          'limit': '1',
+        });
+        final response = await http
+            .get(
+              uri,
+              headers: const {
+                'User-Agent': 'SmartBusGuardian/1.0',
+                'Accept': 'application/json',
+              },
+            )
+            .timeout(const Duration(seconds: 12));
+        if (response.statusCode != 200) {
+          throw StateError('Place search failed with ${response.statusCode}.');
+        }
+        final results = jsonDecode(response.body) as List<dynamic>;
+        if (results.isEmpty) {
+          throw StateError('No matching place was found.');
+        }
+        final result = results.first as Map<String, dynamic>;
+        latitude = double.parse(result['lat'].toString());
+        longitude = double.parse(result['lon'].toString());
+      }
+      final saved = await SavedDestinationService.instance.add(
+        userId: _userId!,
+        name: candidate.name,
+        latitude: latitude,
+        longitude: longitude,
+        syncWithBackend: _syncWithBackend,
+      );
+      if (!mounted) return;
+      setState(() {
+        _savedDestinations.removeWhere(
+          (destination) =>
+              destination.name.toLowerCase() == candidate.name.toLowerCase(),
+        );
+        _savedDestinations.add(
+          Destination(
+            name: candidate.name,
+            subtitle: 'Saved destination',
+            icon: Icons.bookmark_outline,
+            latitude: latitude,
+            longitude: longitude,
+            savedId: int.tryParse(saved['destination_id']?.toString() ?? ''),
+          ),
+        );
+      });
+      _showMessage('${candidate.name} saved.');
+    } catch (error) {
+      if (mounted) _showMessage('Could not save destination: $error');
+    }
+  }
+
+  Future<void> _removeSavedDestination(Destination destination) async {
+    if (_userId == null) return;
+    final record = <String, dynamic>{
+      'name': destination.name,
+      'latitude': destination.latitude,
+      'longitude': destination.longitude,
+      if (destination.savedId != null) 'destination_id': destination.savedId,
+    };
+    await SavedDestinationService.instance.remove(
+      userId: _userId!,
+      destination: record,
+      syncWithBackend: _syncWithBackend,
+    );
+    if (!mounted) return;
+    setState(() => _savedDestinations.remove(destination));
+  }
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _loadCurrentPosition() async {
@@ -299,7 +330,12 @@ class _DestinationScreenState extends State<DestinationScreen> {
         return;
       }
       final position = await Geolocator.getCurrentPosition();
-      if (mounted) setState(() => _currentPosition = position);
+      if (mounted) {
+        final stops = await nearbyBusStopsAt(
+          LatLng(position.latitude, position.longitude),
+        );
+        if (mounted) setState(() => _nearbyStops = stops);
+      }
     } catch (_) {}
   }
 
@@ -309,8 +345,7 @@ class _DestinationScreenState extends State<DestinationScreen> {
     super.dispose();
   }
 
-  List<Destination> get _sortedNearbyStops =>
-      _sortByDistance(_nearbyStops, _currentPosition);
+  List<Destination> get _sortedNearbyStops => _nearbyStops;
 
   List<Destination> get _allDestinations => [
     ..._savedDestinations,
@@ -373,6 +408,12 @@ class _DestinationScreenState extends State<DestinationScreen> {
                       fontWeight: FontWeight.bold,
                       color: AppThemeService.instance.primaryText,
                     ),
+                  ),
+                  const Spacer(),
+                  IconButton(
+                    tooltip: 'Save selected destination',
+                    onPressed: _saveSelectedDestination,
+                    icon: const Icon(Icons.bookmark_add_outlined),
                   ),
                 ],
               ),
@@ -541,6 +582,13 @@ class _DestinationScreenState extends State<DestinationScreen> {
       destination: destination,
       selected: _selected?.name == destination.name,
       onTap: () => _selectDestination(destination),
+      trailing: destination.savedId == null
+          ? null
+          : IconButton(
+              tooltip: 'Remove saved destination',
+              icon: const Icon(Icons.delete_outline),
+              onPressed: () => _removeSavedDestination(destination),
+            ),
     );
   }
 }
@@ -553,13 +601,42 @@ class StartingPointScreen extends StatefulWidget {
 }
 
 class _StartingPointScreenState extends State<StartingPointScreen> {
+  List<Destination> _savedDestinations = [];
+  List<Destination> _nearbyStops = [];
   Position? _currentPosition;
   Destination? _selected;
 
   @override
   void initState() {
     super.initState();
-    _loadCurrentPosition();
+    unawaited(_loadSavedDestinations());
+    unawaited(_loadCurrentPosition());
+  }
+
+  Future<void> _loadSavedDestinations() async {
+    final user = await AuthService.instance.getCurrentUser();
+    final rawId = user?['id'];
+    final userId = rawId is int ? rawId : int.tryParse(rawId?.toString() ?? '');
+    if (userId == null) return;
+    final saved = await SavedDestinationService.instance.load(
+      userId: userId,
+      syncWithBackend: user?['backend_synced'] == true,
+    );
+    if (!mounted) return;
+    setState(() {
+      _savedDestinations = saved
+          .map(
+            (item) => Destination(
+              name: item['name'].toString(),
+              subtitle: 'Saved destination',
+              icon: Icons.bookmark_outline,
+              latitude: (item['latitude'] as num).toDouble(),
+              longitude: (item['longitude'] as num).toDouble(),
+              savedId: int.tryParse(item['destination_id']?.toString() ?? ''),
+            ),
+          )
+          .toList();
+    });
   }
 
   Future<void> _loadCurrentPosition() async {
@@ -574,7 +651,13 @@ class _StartingPointScreenState extends State<StartingPointScreen> {
         return;
       }
       final position = await Geolocator.getCurrentPosition();
-      if (mounted) setState(() => _currentPosition = position);
+      if (mounted) {
+        setState(() => _currentPosition = position);
+        final stops = await nearbyBusStopsAt(
+          LatLng(position.latitude, position.longitude),
+        );
+        if (mounted) setState(() => _nearbyStops = stops);
+      }
     } catch (_) {}
   }
 
@@ -745,12 +828,14 @@ class DestinationOptionTile extends StatelessWidget {
   final Destination destination;
   final bool selected;
   final VoidCallback onTap;
+  final Widget? trailing;
 
   const DestinationOptionTile({
     super.key,
     required this.destination,
     required this.selected,
     required this.onTap,
+    this.trailing,
   });
 
   @override
@@ -798,12 +883,13 @@ class DestinationOptionTile extends StatelessWidget {
                     ],
                   ),
                 ),
-                Icon(
-                  selected ? Icons.check_circle : Icons.chevron_right,
-                  color: selected
-                      ? kPrimaryPurple
-                      : AppThemeService.instance.mutedText,
-                ),
+                trailing ??
+                    Icon(
+                      selected ? Icons.check_circle : Icons.chevron_right,
+                      color: selected
+                          ? kPrimaryPurple
+                          : AppThemeService.instance.mutedText,
+                    ),
               ],
             ),
           ),
