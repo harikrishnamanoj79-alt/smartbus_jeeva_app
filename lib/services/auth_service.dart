@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
@@ -7,11 +8,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'api_service.dart';
+import 'emergency_service.dart';
+import 'journey_service.dart';
 
 class AuthService {
   AuthService._() {
     ApiService.onUnauthorized = () {
-      _clearJwt();
+      // Do not clear JWT immediately in listener; allow safety check in main.dart
       sessionExpiredNotifier.value = true;
     };
   }
@@ -22,10 +25,17 @@ class AuthService {
 
   void checkPendingReLogin() {
     if (pendingReLogin) {
-      pendingReLogin = false;
-      sessionExpiredNotifier.value = true;
+      final isSos = EmergencyService.instance.isSosTriggered;
+      final isJourney = JourneyService.instance.isJourneyActive;
+      if (!isSos && !isJourney) {
+        pendingReLogin = false;
+        clearJwtToken();
+        sessionExpiredNotifier.value = true;
+      }
     }
   }
+
+  Future<void> clearJwtToken() => _clearJwt();
 
   static const _storageKey = 'smartbus_registered_users_v2';
   static const _sessionKey = 'smartbus_current_user_session_v2';
@@ -254,49 +264,22 @@ class AuthService {
     }
 
     if (matchedUser != null) {
-      // User verified locally. Now fetch a fresh JWT token from backend.
-      try {
-        final emailToUse = (matchedUser['email'] ?? identifier).toString();
-        final apiResult = await ApiService.loginUser(
-          email: emailToUse,
-          password: normalizedPassword,
-        );
-        if (apiResult['success'] == true) {
-          if (apiResult['access_token'] != null) {
-            await _saveJwt(apiResult['access_token'].toString());
-          }
-          if (apiResult['user'] is Map) {
-            final backendUser = Map<String, dynamic>.from(apiResult['user'] as Map);
-            matchedUser['id'] = backendUser['user_id'] ?? backendUser['id'] ?? matchedUser['id'];
-            matchedUser['backend_synced'] = true;
-          }
-        } else if (matchedUser['backend_synced'] != true) {
-          // If offline user is not on backend yet, sync registration
-          final regResult = await ApiService.registerUser(
-            fullName: matchedUser['name'] ?? matchedUser['username'] ?? 'Passenger',
-            email: emailToUse,
-            phoneNumber: (matchedUser['phone'] ?? '').toString(),
-            password: normalizedPassword,
-          );
-          if (regResult['success'] == true) {
-            if (regResult['access_token'] != null) {
-              await _saveJwt(regResult['access_token'].toString());
-            }
-            if (regResult['user_id'] != null) {
-              matchedUser['id'] = regResult['user_id'];
-              matchedUser['backend_synced'] = true;
-            }
-          }
-        }
-      } catch (error) {
-        debugPrint('Backend sync / token fetch during login: $error');
-      }
-
       if (!matchedUser.containsKey('password_hash')) {
         matchedUser.remove('password');
         matchedUser.addAll(_passwordFields(normalizedPassword));
-        users[matchedEmail!] = matchedUser;
+        if (matchedEmail != null) users[matchedEmail] = matchedUser;
       }
+      await _saveUsers(users);
+      await _setCurrentUser(matchedUser);
+
+      // Perform background token refresh and sync without hanging offline login
+      unawaited(_syncBackendSessionInBackground(
+        matchedUser: matchedUser,
+        matchedEmail: matchedEmail,
+        password: normalizedPassword,
+      ));
+
+      return null;
     } else {
       final apiResult = await ApiService.loginUser(
         email: identifier.trim(),
@@ -321,16 +304,92 @@ class AuthService {
         };
         matchedEmail = matchedUser['email']?.toString();
         if (matchedEmail != null) users[matchedEmail] = matchedUser;
+        await _saveUsers(users);
+        await _setCurrentUser(matchedUser);
+
+        unawaited(JourneyService.instance.flushPendingSyncs());
+        unawaited(EmergencyService.instance.flushPendingSyncs());
+        return null;
       }
     }
 
-    if (matchedUser == null) {
-      return 'Email/phone and password do not match';
-    }
+    return 'Email/phone and password do not match';
+  }
 
-    await _saveUsers(users);
-    await _setCurrentUser(matchedUser);
-    return null;
+  Future<void> _syncBackendSessionInBackground({
+    required Map<String, dynamic> matchedUser,
+    required String? matchedEmail,
+    required String password,
+  }) async {
+    try {
+      final emailToUse = (matchedUser['email'] ?? matchedEmail ?? '').toString();
+      final apiResult = await ApiService.loginUser(
+        email: emailToUse,
+        password: password,
+      );
+
+      if (apiResult['success'] == true) {
+        if (apiResult['access_token'] != null) {
+          await _saveJwt(apiResult['access_token'].toString());
+        }
+        if (apiResult['user'] is Map) {
+          final backendUser = Map<String, dynamic>.from(apiResult['user'] as Map);
+          matchedUser['id'] = backendUser['user_id'] ?? backendUser['id'] ?? matchedUser['id'];
+          matchedUser['backend_synced'] = true;
+          final users = await _loadUsers();
+          if (matchedEmail != null) {
+            users[matchedEmail] = matchedUser;
+            await _saveUsers(users);
+          }
+          final current = await getCurrentUser();
+          if (current?['email'] == matchedUser['email']) {
+            await _setCurrentUser(matchedUser);
+          }
+        }
+        unawaited(JourneyService.instance.flushPendingSyncs());
+        unawaited(EmergencyService.instance.flushPendingSyncs());
+      } else {
+        final errorStr = (apiResult['error'] ?? apiResult['message'] ?? '').toString().toLowerCase();
+        final isConnectionError = errorStr.contains('cannot connect') ||
+            errorStr.contains('socket') ||
+            errorStr.contains('timeout') ||
+            errorStr.contains('network') ||
+            errorStr.contains('unreachable');
+
+        // Only try registration if the server actually replied (not on connection/timeout error)
+        if (!isConnectionError && matchedUser['backend_synced'] != true) {
+          final regResult = await ApiService.registerUser(
+            fullName: matchedUser['name'] ?? matchedUser['username'] ?? 'Passenger',
+            email: emailToUse,
+            phoneNumber: (matchedUser['phone'] ?? '').toString(),
+            password: password,
+          );
+          if (regResult['success'] == true) {
+            if (regResult['access_token'] != null) {
+              await _saveJwt(regResult['access_token'].toString());
+            }
+            if (regResult['user_id'] != null) {
+              matchedUser['id'] = regResult['user_id'];
+              matchedUser['backend_synced'] = true;
+              final users = await _loadUsers();
+              if (matchedEmail != null) {
+                users[matchedEmail] = matchedUser;
+                await _saveUsers(users);
+              }
+              final current = await getCurrentUser();
+              if (current?['email'] == matchedUser['email']) {
+                await _setCurrentUser(matchedUser);
+              }
+            }
+            unawaited(JourneyService.instance.flushPendingSyncs());
+            unawaited(EmergencyService.instance.flushPendingSyncs());
+          }
+        }
+      }
+    } catch (error) {
+      debugPrint('Background backend sync failed: $error');
+    }
+  }
   }
 
   Future<bool> updateProfile({

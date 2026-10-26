@@ -15,8 +15,17 @@ final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Ensure active journey is loaded into memory before any network calls or UI renders
+  await JourneyService.instance.init();
   await BackgroundTrackingService.instance.initialize();
   unawaited(AppThemeService.instance.load());
+
+  // Configure ApiService safety predicate so tokens are never wiped mid-journey or mid-SOS
+  ApiService.isSafetySessionActive = () {
+    return EmergencyService.instance.isSosTriggered ||
+        JourneyService.instance.isJourneyActive;
+  };
+
   runApp(const SmartBusGuardian());
 }
 
@@ -48,7 +57,7 @@ class _SmartBusGuardianState extends State<SmartBusGuardian> {
       final navContext = appNavigatorKey.currentContext;
 
       final isSosActive = EmergencyService.instance.isSosTriggered;
-      final isJourneyActive = JourneyService.instance.activeJourneyNotifier.value != null;
+      final isJourneyActive = JourneyService.instance.isJourneyActive;
 
       if (isSosActive || isJourneyActive) {
         // Never pull the user out mid-emergency or mid-journey!
@@ -65,6 +74,9 @@ class _SmartBusGuardianState extends State<SmartBusGuardian> {
         AuthService.instance.pendingReLogin = true;
         return;
       }
+
+      // Safe to clear token now that no emergency or journey is active
+      unawaited(AuthService.instance.clearJwtToken());
 
       if (navContext != null) {
         ScaffoldMessenger.maybeOf(navContext)?.showSnackBar(

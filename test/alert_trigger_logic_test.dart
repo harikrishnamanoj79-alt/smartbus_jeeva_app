@@ -168,9 +168,30 @@ void main() {
 
       ApiService.checkResponseForTesting(response401, isAuthEndpoint: false);
       expect(hookCalled, isTrue);
-      // Token must be cleared
+      // Token must be cleared when safety session is not active
       expect(ApiService.jwtToken, isNull);
 
+      ApiService.onUnauthorized = null;
+    });
+
+    test('onUnauthorized hook preserves token when isSafetySessionActive is true', () {
+      bool hookCalled = false;
+      ApiService.onUnauthorized = () {
+        hookCalled = true;
+      };
+      ApiService.isSafetySessionActive = () => true;
+      ApiService.setJwtToken('active-journey-token');
+
+      final response401 = http.Response('{"error": "Token expired"}', 401);
+
+      ApiService.checkResponseForTesting(response401, isAuthEndpoint: false);
+      expect(hookCalled, isTrue);
+      // Token must NOT be cleared during active safety session!
+      expect(ApiService.jwtToken, 'active-journey-token');
+
+      // Clean up
+      ApiService.setJwtToken(null);
+      ApiService.isSafetySessionActive = null;
       ApiService.onUnauthorized = null;
     });
   });

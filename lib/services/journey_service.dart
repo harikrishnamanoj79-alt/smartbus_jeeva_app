@@ -11,14 +11,69 @@ class JourneyService {
 
   static const String _historyKey = 'smartbus_journey_history_v2';
   static const String _activeJourneyKey = 'smartbus_active_journey_v2';
+  static const String _pendingFinishedJourneysKey = 'smartbus_pending_finished_journeys_v1';
 
   final ValueNotifier<JourneyRecord?> activeJourneyNotifier =
       ValueNotifier<JourneyRecord?>(null);
+
+  bool get isJourneyActive => activeJourneyNotifier.value != null;
 
   /// Initializes and loads active journey if any
   Future<void> init() async {
     final active = await getActiveJourney();
     activeJourneyNotifier.value = active;
+  }
+
+  Future<void> _queuePendingFinishedJourney({
+    required int journeyId,
+    required int userId,
+    required double distanceKm,
+    required String status,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_pendingFinishedJourneysKey);
+    List<dynamic> list = [];
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        list = jsonDecode(raw) as List;
+      } catch (_) {}
+    }
+    list.removeWhere((item) => item['journeyId'] == journeyId);
+    list.add({
+      'journeyId': journeyId,
+      'userId': userId,
+      'distanceKm': distanceKm,
+      'status': status,
+    });
+    await prefs.setString(_pendingFinishedJourneysKey, jsonEncode(list));
+  }
+
+  Future<void> flushPendingSyncs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_pendingFinishedJourneysKey);
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final list = (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
+      final remaining = <Map<String, dynamic>>[];
+      for (final item in list) {
+        final res = await ApiService.finishJourney(
+          journeyId: item['journeyId'] as int,
+          userId: item['userId'] as int,
+          distanceTravelledKm: (item['distanceKm'] as num).toDouble(),
+          status: item['status'] as String,
+        );
+        if (res['success'] != true) {
+          remaining.add(item);
+        }
+      }
+      if (remaining.isEmpty) {
+        await prefs.remove(_pendingFinishedJourneysKey);
+      } else {
+        await prefs.setString(_pendingFinishedJourneysKey, jsonEncode(remaining));
+      }
+    } catch (e) {
+      debugPrint('Error flushing pending journeys: $e');
+    }
   }
 
   /// Starts a new journey and saves it as active
@@ -114,8 +169,14 @@ class JourneyService {
       );
       if (result['success'] != true) {
         debugPrint(
-          'Backend journey completion failed: '
+          'Backend journey completion failed, queueing for retry: '
           '${result['error'] ?? result['message'] ?? 'invalid response'}',
+        );
+        await _queuePendingFinishedJourney(
+          journeyId: current.backendId!,
+          userId: current.userId,
+          distanceKm: finishedJourney.distanceKm ?? 0,
+          status: missed ? 'MISSED' : 'COMPLETED',
         );
       }
     }

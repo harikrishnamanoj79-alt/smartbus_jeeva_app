@@ -27,6 +27,22 @@ def init_db():
         try:
             shutil.copy2(db_path, backup_path)
             print(f"[Backup] Existing database safely backed up to: {backup_path}")
+
+            # Prune older backups to prevent unbounded accumulation (keep last 3)
+            prefix = f"{DB_NAME}.backup_"
+            existing_backups = [
+                os.path.join(base_dir, f)
+                for f in os.listdir(base_dir)
+                if f.startswith(prefix)
+            ]
+            existing_backups.sort(key=lambda p: os.path.getmtime(p))
+            while len(existing_backups) > 3:
+                oldest = existing_backups.pop(0)
+                try:
+                    os.remove(oldest)
+                    print(f"[Backup Cleanup] Removed old backup: {os.path.basename(oldest)}")
+                except OSError:
+                    pass
         except Exception as e:
             print(f"[Backup Warning] Could not create backup before migration: {e}")
 

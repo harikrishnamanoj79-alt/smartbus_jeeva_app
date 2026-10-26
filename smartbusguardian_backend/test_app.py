@@ -347,6 +347,19 @@ class BackendApiTest(unittest.TestCase):
         )
         self.assertEqual(locked_out.status_code, 429)
 
+        # Forged X-Forwarded-For header must NOT bypass rate limiting
+        forged_attempt = self.client.post(
+            "/api/login",
+            headers={"X-Forwarded-For": "198.51.100.99"},
+            json={"identifier": "ratelimit@example.test", "password": "wrongpassword"},
+        )
+        self.assertEqual(forged_attempt.status_code, 429)
+
+    def test_phone_normalization_leading_zero(self):
+        # 11 digits with leading trunk 0 should become +91 followed by 10 digits
+        norm = backend.normalize_phone_number("09876543210")
+        self.assertEqual(norm, "+919876543210")
+
     def test_unauthorized_token_flow(self):
         # Missing token
         res_no_token = self.client.get("/api/journey/history/1")

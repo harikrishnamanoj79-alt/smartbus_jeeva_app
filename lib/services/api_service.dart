@@ -22,6 +22,7 @@ class ApiService {
 
   static String? _jwtToken;
   static VoidCallback? onUnauthorized;
+  static bool Function()? isSafetySessionActive;
 
   static void setJwtToken(String? token) {
     _jwtToken = token;
@@ -33,7 +34,12 @@ class ApiService {
     // 2. A JWT token was actually provided with the request (not an unauthenticated call)
     if (response.statusCode == 401 && !isAuthEndpoint) {
       if (_jwtToken != null && _jwtToken!.isNotEmpty) {
-        setJwtToken(null);
+        final safetyActive = isSafetySessionActive?.call() ?? false;
+        // Do not immediately wipe token while an active journey or SOS emergency is running.
+        // Defer token clearance until the active safety session completes.
+        if (!safetyActive) {
+          setJwtToken(null);
+        }
         onUnauthorized?.call();
       }
     }

@@ -695,6 +695,48 @@ class EmergencyService {
     });
   }
 
+  static const String _pendingSosUpdatesKey = 'smartbus_pending_sos_updates_v1';
+
+  Future<void> _queuePendingSosStatusUpdate(int sosId, String status) async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_pendingSosUpdatesKey);
+    List<dynamic> list = [];
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        list = jsonDecode(raw) as List;
+      } catch (_) {}
+    }
+    list.removeWhere((item) => item['sosId'] == sosId);
+    list.add({'sosId': sosId, 'status': status});
+    await prefs.setString(_pendingSosUpdatesKey, jsonEncode(list));
+  }
+
+  Future<void> flushPendingSyncs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_pendingSosUpdatesKey);
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final list = (jsonDecode(raw) as List).cast<Map<String, dynamic>>();
+      final remaining = <Map<String, dynamic>>[];
+      for (final item in list) {
+        final res = await ApiService.updateSosStatus(
+          sosId: item['sosId'] as int,
+          status: item['status'] as String,
+        );
+        if (!res) {
+          remaining.add(item);
+        }
+      }
+      if (remaining.isEmpty) {
+        await prefs.remove(_pendingSosUpdatesKey);
+      } else {
+        await prefs.setString(_pendingSosUpdatesKey, jsonEncode(remaining));
+      }
+    } catch (e) {
+      debugPrint('Error flushing pending SOS updates: $e');
+    }
+  }
+
   void stopSiren() {
     _isSirenActive = false;
     sirenNotifier.value = false;
@@ -707,10 +749,25 @@ class EmergencyService {
   }
 
   void resolveSos() {
+    final record = _activeSosRecord;
     stopSiren();
     _isSosTriggered = false;
     sosActiveNotifier.value = false;
     _activeSosRecord = null;
+
+    if (record?.backendId != null) {
+      ApiService.updateSosStatus(
+        sosId: record!.backendId!,
+        status: 'RESOLVED',
+      ).then((success) {
+        if (!success) {
+          _queuePendingSosStatusUpdate(record.backendId!, 'RESOLVED');
+        }
+      }).catchError((_) {
+        _queuePendingSosStatusUpdate(record.backendId!, 'RESOLVED');
+      });
+    }
+
     AuthService.instance.checkPendingReLogin();
   }
 }

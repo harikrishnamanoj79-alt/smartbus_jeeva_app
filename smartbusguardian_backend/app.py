@@ -69,17 +69,26 @@ jwt = JWTManager(app)
 
 @jwt.unauthorized_loader
 def unauthorized_callback(callback):
-    return jsonify({"error": "Missing or unauthorized authorization token", "message": str(callback)}), 401
+    return jsonify({"error": "Missing or unauthorized authorization token"}), 401
 
 
 @jwt.invalid_token_loader
 def invalid_token_callback(callback):
-    return jsonify({"error": "Invalid authorization token", "message": str(callback)}), 401
+    return jsonify({"error": "Invalid authorization token"}), 401
 
 
 @jwt.expired_token_loader
 def expired_token_callback(jwt_header, jwt_payload):
     return jsonify({"error": "Authorization token has expired"}), 401
+
+
+# Configure reverse proxy support securely via ProxyFix if enabled
+BEHIND_PROXY = os.environ.get("BEHIND_PROXY", "").strip().lower() in ("1", "true", "yes")
+NUM_PROXIES = int(os.environ.get("NUM_PROXIES", "1")) if BEHIND_PROXY else 0
+
+if BEHIND_PROXY and NUM_PROXIES > 0:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=NUM_PROXIES, x_proto=NUM_PROXIES, x_host=NUM_PROXIES)
 
 # Thread-safe in-memory sliding-window rate limit trackers
 _RATE_LIMIT_LOCK = threading.Lock()
@@ -93,11 +102,11 @@ DEFAULT_COUNTRY_CODE = os.environ.get("DEFAULT_COUNTRY_CODE", "+91")
 
 def get_client_ip():
     """
-    Extracts the client IP address, respecting X-Forwarded-For if behind a reverse proxy.
+    Extracts the client IP address.
+    When BEHIND_PROXY is enabled, Werkzeug's ProxyFix securely resolves request.remote_addr.
+    Otherwise, request.remote_addr is used directly, preventing clients from bypassing
+    rate limiting via forged X-Forwarded-For headers.
     """
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
     return request.remote_addr or "client"
 
 
@@ -173,6 +182,9 @@ def normalize_phone_number(raw_phone, default_country_code=DEFAULT_COUNTRY_CODE)
         return f"+{digits}"
     if raw.startswith("00"):
         return f"+{digits[2:]}"
+    # Strip leading trunk '0' for 11-digit numbers (common in India: e.g. 09876543210 -> 9876543210)
+    if len(digits) == 11 and digits.startswith("0"):
+        digits = digits[1:]
     if len(digits) == 10 and default_country_code:
         prefix = default_country_code if default_country_code.startswith("+") else f"+{default_country_code}"
         return f"{prefix}{digits}"
