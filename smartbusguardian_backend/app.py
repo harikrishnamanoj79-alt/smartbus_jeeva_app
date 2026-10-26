@@ -18,16 +18,49 @@ from flask_jwt_extended import (
     get_jwt_identity,
 )
 
+import secrets
+import threading
+
 app = Flask(__name__)
 
 # JWT Configuration
-app.config["JWT_SECRET_KEY"] = os.environ.get(
-    "JWT_SECRET_KEY", "smartbus-guardian-production-secret-key-v1"
-)
+def get_jwt_secret():
+    """
+    Returns JWT secret from environment or generates a secure random
+    secret persisted in .jwt_secret.
+    """
+    env_secret = os.environ.get("JWT_SECRET_KEY")
+    if env_secret and env_secret.strip():
+        return env_secret.strip()
+
+    secret_file = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        ".jwt_secret"
+    )
+    if os.path.exists(secret_file):
+        try:
+            with open(secret_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return content
+        except OSError:
+            pass
+
+    new_secret = secrets.token_hex(32)
+    try:
+        with open(secret_file, "w", encoding="utf-8") as f:
+            f.write(new_secret)
+    except OSError:
+        pass
+    return new_secret
+
+app.config["JWT_SECRET_KEY"] = get_jwt_secret()
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = datetime.timedelta(days=30)
 jwt = JWTManager(app)
 
-# In-memory sliding-window rate limit trackers
+# Thread-safe in-memory sliding-window rate limit trackers
+_RATE_LIMIT_LOCK = threading.Lock()
+_LAST_PRUNE_TIME = time.time()
 LOGIN_ATTEMPTS = {}  # key -> list of timestamp floats
 SMS_ATTEMPTS = {}    # user_id -> list of timestamp floats
 
@@ -36,18 +69,36 @@ HELPLINE_NUMBERS = {"112", "100", "108", "1091", "911", "999", "000"}
 
 def check_rate_limit(tracker_dict, key, max_attempts=5, window_seconds=300):
     """
+    Thread-safe sliding-window rate limit checker with automatic memory pruning.
     Returns True if allowed, False if rate limit exceeded.
     """
+    global _LAST_PRUNE_TIME
     now = time.time()
-    attempts = tracker_dict.get(key, [])
-    # Prune expired timestamps
-    attempts = [t for t in attempts if now - t < window_seconds]
-    if len(attempts) >= max_attempts:
+
+    with _RATE_LIMIT_LOCK:
+        # Periodic pruning every 60 seconds to prevent unbounded memory growth
+        if now - _LAST_PRUNE_TIME > 60:
+            _LAST_PRUNE_TIME = now
+            for tracker in (LOGIN_ATTEMPTS, SMS_ATTEMPTS):
+                expired_keys = []
+                for k, timestamps in tracker.items():
+                    valid = [t for t in timestamps if now - t < 3600]
+                    if not valid:
+                        expired_keys.append(k)
+                    else:
+                        tracker[k] = valid
+                for k in expired_keys:
+                    tracker.pop(k, None)
+
+        attempts = tracker_dict.get(key, [])
+        # Prune expired timestamps for current key
+        attempts = [t for t in attempts if now - t < window_seconds]
+        if len(attempts) >= max_attempts:
+            tracker_dict[key] = attempts
+            return False
+        attempts.append(now)
         tracker_dict[key] = attempts
-        return False
-    attempts.append(now)
-    tracker_dict[key] = attempts
-    return True
+        return True
 
 
 def normalize_phone_number(raw_phone):
@@ -977,30 +1028,65 @@ def send_sms_message():
     try:
         from twilio.rest import Client
         client = Client(account_sid, auth_token)
-        sent_count = 0
-        for phone_number in eligible_numbers:
+    except Exception as exc:
+        app.logger.error("Failed to initialize Twilio client: %s", exc)
+        return jsonify({
+            "success": False,
+            "fallback": "device",
+            "backend": "twilio",
+            "sent_to": 0,
+            "sent_numbers": [],
+            "failed_numbers": eligible_numbers,
+            "error": "Failed to initialize SMS gateway. Device SMS fallback should be used."
+        }), 502
+
+    sent_numbers = []
+    failed_numbers = []
+
+    for phone_number in eligible_numbers:
+        try:
             client.messages.create(
                 body=message,
                 from_=from_number,
                 to=phone_number,
             )
-            sent_count += 1
+            sent_numbers.append(phone_number)
+        except Exception as exc:
+            app.logger.warning("Twilio SMS transmission failed for %s: %s", phone_number, exc)
+            failed_numbers.append(phone_number)
 
-        return jsonify({
-            "success": True,
-            "fallback": "none",
-            "backend": "twilio",
-            "sent_to": sent_count,
-            "message": f"Emergency SMS sent successfully via backend to {sent_count} contact(s)"
-        }), 200
-    except Exception as exc:
-        app.logger.error("Twilio SMS transmission failed: %s", exc)
+    if failed_numbers and not sent_numbers:
         return jsonify({
             "success": False,
             "fallback": "device",
             "backend": "twilio",
-            "error": "Failed to deliver SMS through gateway. Device SMS fallback will be used."
+            "sent_to": 0,
+            "sent_numbers": [],
+            "failed_numbers": failed_numbers,
+            "error": "Failed to deliver SMS to any contact via gateway. Device SMS fallback should be used."
         }), 502
+    elif failed_numbers and sent_numbers:
+        return jsonify({
+            "success": True,
+            "partial": True,
+            "fallback": "device_for_failed",
+            "backend": "twilio",
+            "sent_to": len(sent_numbers),
+            "sent_numbers": sent_numbers,
+            "failed_numbers": failed_numbers,
+            "message": f"SMS sent to {len(sent_numbers)} contact(s), but failed for {len(failed_numbers)} contact(s)."
+        }), 200
+    else:
+        return jsonify({
+            "success": True,
+            "partial": False,
+            "fallback": "none",
+            "backend": "twilio",
+            "sent_to": len(sent_numbers),
+            "sent_numbers": sent_numbers,
+            "failed_numbers": [],
+            "message": f"Emergency SMS sent successfully via backend to {len(sent_numbers)} contact(s)"
+        }), 200
 
 
 # ============================================================

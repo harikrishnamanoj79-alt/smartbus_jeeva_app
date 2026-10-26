@@ -60,6 +60,29 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_sos_user ON tbl_sos_alert(user_id);
         """)
 
+    # 3. Migrate unique constraints for existing databases via unique indexes
+    try:
+        cursor.execute("""
+            DELETE FROM tbl_emergency_contact
+            WHERE contact_id NOT IN (
+                SELECT MIN(contact_id) FROM tbl_emergency_contact GROUP BY user_id, contact_phone
+            );
+        """)
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_user_contact_phone ON tbl_emergency_contact(user_id, contact_phone);")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cursor.execute("""
+            DELETE FROM tbl_saved_destinations
+            WHERE destination_id NOT IN (
+                SELECT MIN(destination_id) FROM tbl_saved_destinations GROUP BY user_id, destination_name
+            );
+        """)
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_user_destination ON tbl_saved_destinations(user_id, destination_name);")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.execute("PRAGMA foreign_keys = ON;")
 

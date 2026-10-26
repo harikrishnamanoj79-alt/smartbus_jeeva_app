@@ -5,9 +5,12 @@ import 'screens/auth_screen.dart';
 import 'screens/home_screen.dart';
 import 'screens/login_screen.dart';
 import 'services/api_service.dart';
+import 'services/auth_service.dart';
 import 'services/journey_service.dart';
 import 'services/theme_service.dart';
 import 'services/background_tracking_service.dart';
+
+final GlobalKey<NavigatorState> appNavigatorKey = GlobalKey<NavigatorState>();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,10 +19,46 @@ void main() async {
   runApp(const SmartBusGuardian());
 }
 
-class SmartBusGuardian extends StatelessWidget {
+class SmartBusGuardian extends StatefulWidget {
   final bool? isLoggedIn;
 
   const SmartBusGuardian({super.key, this.isLoggedIn});
+
+  @override
+  State<SmartBusGuardian> createState() => _SmartBusGuardianState();
+}
+
+class _SmartBusGuardianState extends State<SmartBusGuardian> {
+  @override
+  void initState() {
+    super.initState();
+    AuthService.instance.sessionExpiredNotifier.addListener(_onSessionExpired);
+  }
+
+  @override
+  void dispose() {
+    AuthService.instance.sessionExpiredNotifier.removeListener(_onSessionExpired);
+    super.dispose();
+  }
+
+  void _onSessionExpired() {
+    if (AuthService.instance.sessionExpiredNotifier.value) {
+      AuthService.instance.sessionExpiredNotifier.value = false;
+      final navContext = appNavigatorKey.currentContext;
+      if (navContext != null) {
+        ScaffoldMessenger.maybeOf(navContext)?.showSnackBar(
+          const SnackBar(
+            content: Text('Your session has expired. Please sign in again.'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+      appNavigatorKey.currentState?.pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+        (route) => false,
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -27,14 +66,15 @@ class SmartBusGuardian extends StatelessWidget {
       animation: AppThemeService.instance.themeMode,
       builder: (context, _) {
         return MaterialApp(
+          navigatorKey: appNavigatorKey,
           debugShowCheckedModeBanner: false,
           title: 'SmartBus Guardian',
           theme: AppThemeService.instance.lightTheme,
           darkTheme: AppThemeService.instance.darkTheme,
           themeMode: AppThemeService.instance.themeMode.value,
-          home: isLoggedIn == null
+          home: widget.isLoggedIn == null
               ? const _SplashScreen()
-              : isLoggedIn!
+              : widget.isLoggedIn!
               ? const HomeScreen()
               : const LoginScreen(),
         );

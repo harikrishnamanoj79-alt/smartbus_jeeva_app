@@ -21,9 +21,22 @@ class ApiService {
   static const Duration _timeout = Duration(seconds: 12);
 
   static String? _jwtToken;
+  static VoidCallback? onUnauthorized;
 
   static void setJwtToken(String? token) {
     _jwtToken = token;
+  }
+
+  static void _checkResponse(http.Response response) {
+    if (response.statusCode == 401) {
+      setJwtToken(null);
+      onUnauthorized?.call();
+    }
+  }
+
+  static dynamic _handleResponse(http.Response response) {
+    _checkResponse(response);
+    return jsonDecode(response.body);
   }
 
   static Map<String, String> get _headers {
@@ -71,7 +84,7 @@ class ApiService {
           )
           .timeout(_timeout);
 
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (e) {
       return {'success': false, 'error': 'Cannot connect to server: $e'};
     }
@@ -97,7 +110,7 @@ class ApiService {
           )
           .timeout(_timeout);
 
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (e) {
       return {'success': false, 'error': 'Cannot connect to server: $e'};
     }
@@ -121,7 +134,7 @@ class ApiService {
             }),
           )
           .timeout(_timeout);
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (error) {
       return {'success': false, 'error': 'Cannot connect to server: $error'};
     }
@@ -143,7 +156,7 @@ class ApiService {
             }),
           )
           .timeout(_timeout);
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (error) {
       return {'success': false, 'error': 'Cannot connect to server: $error'};
     }
@@ -174,7 +187,7 @@ class ApiService {
           )
           .timeout(_timeout);
 
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (e) {
       return {'success': false, 'error': 'Cannot connect to server: $e'};
     }
@@ -198,7 +211,7 @@ class ApiService {
             }),
           )
           .timeout(_timeout);
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (error) {
       return {'success': false, 'error': 'Cannot connect to server: $error'};
     }
@@ -223,7 +236,7 @@ class ApiService {
             }),
           )
           .timeout(_timeout);
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (error) {
       return {'success': false, 'error': 'Cannot connect to server: $error'};
     }
@@ -263,6 +276,7 @@ class ApiService {
       final response = await http
           .get(Uri.parse('$baseUrl/api/saved-destinations/$userId'), headers: _headers)
           .timeout(_timeout);
+      _checkResponse(response);
       if (response.statusCode != 200) {
         throw StateError('Saved destinations request failed: ${response.body}');
       }
@@ -293,7 +307,7 @@ class ApiService {
             }),
           )
           .timeout(_timeout);
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (error) {
       return {'success': false, 'error': 'Cannot connect to server: $error'};
     }
@@ -307,6 +321,7 @@ class ApiService {
             headers: _headers,
           )
           .timeout(_timeout);
+      _checkResponse(response);
       return response.statusCode == 200 || response.statusCode == 404;
     } catch (error) {
       debugPrint('Saved destination deletion failed: $error');
@@ -321,6 +336,7 @@ class ApiService {
       final response = await http
           .get(Uri.parse('$baseUrl/api/journey/history/$userId'), headers: _headers)
           .timeout(_timeout);
+      _checkResponse(response);
       if (response.statusCode != 200) {
         throw StateError('Journey history request failed: ${response.body}');
       }
@@ -343,6 +359,7 @@ class ApiService {
             headers: _headers,
           )
           .timeout(_timeout);
+      _checkResponse(response);
       return response.statusCode == 200 || response.statusCode == 404;
     } catch (error) {
       debugPrint('Journey history deletion failed: $error');
@@ -355,6 +372,7 @@ class ApiService {
       final response = await http
           .delete(Uri.parse('$baseUrl/api/journey/history/$userId'), headers: _headers)
           .timeout(_timeout);
+      _checkResponse(response);
       return response.statusCode == 200;
     } catch (error) {
       debugPrint('Journey history clearing failed: $error');
@@ -383,7 +401,7 @@ class ApiService {
           )
           .timeout(_timeout);
 
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (e) {
       return {'success': false, 'error': 'Cannot connect to server: $e'};
     }
@@ -395,6 +413,7 @@ class ApiService {
       final response = await http
           .get(Uri.parse('$baseUrl/api/contacts/$userId'), headers: _headers)
           .timeout(_timeout);
+      _checkResponse(response);
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         if (data['success'] == true && data['contacts'] != null) {
@@ -428,7 +447,7 @@ class ApiService {
           )
           .timeout(_timeout);
 
-      return jsonDecode(response.body);
+      return _handleResponse(response);
     } catch (e) {
       return {'success': false, 'error': 'Cannot connect to server: $e'};
     }
@@ -440,6 +459,7 @@ class ApiService {
       final response = await http
           .delete(Uri.parse('$baseUrl/api/contacts/$contactId'), headers: _headers)
           .timeout(_timeout);
+      _checkResponse(response);
       return response.statusCode == 200;
     } catch (e) {
       return false;
@@ -462,6 +482,7 @@ class ApiService {
             }),
           )
           .timeout(_timeout);
+      _checkResponse(response);
 
       final decoded = jsonDecode(response.body);
       if (decoded is Map<String, dynamic>) {
@@ -486,6 +507,7 @@ class ApiService {
             body: jsonEncode({'status': status}),
           )
           .timeout(_timeout);
+      _checkResponse(response);
       return response.statusCode == 200;
     } catch (_) {
       return false;
@@ -498,6 +520,7 @@ class ApiService {
       final response = await http
           .get(Uri.parse('$baseUrl/api/sos/$userId'), headers: _headers)
           .timeout(_timeout);
+      _checkResponse(response);
       if (response.statusCode == 200) {
         final data = jsonDecode(response.body);
         if (data['success'] == true && data['alerts'] != null) {

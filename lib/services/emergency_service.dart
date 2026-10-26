@@ -413,34 +413,87 @@ class EmergencyService {
     }
   }
 
-  Future<bool> sendSosViaBackend({
+  Future<Map<String, dynamic>> sendSosViaBackendDetailed({
     required List<EmergencyContact> contacts,
     required String message,
   }) async {
-    final phoneNumbers = contacts
-        .map((c) => c.phone.replaceAll(RegExp(r'[^0-9+]'), ''))
-        .where((p) => p.isNotEmpty && !isEmergencyHelplinePhoneNumber(p))
+    final eligibleContacts = contacts
+        .where(
+          (c) =>
+              c.phone.trim().isNotEmpty &&
+              !isEmergencyHelplinePhoneNumber(c.phone),
+        )
         .toList();
-    if (phoneNumbers.isEmpty) return false;
+    if (eligibleContacts.isEmpty) {
+      return {
+        'success': false,
+        'fallback': 'none',
+        'sent_to': 0,
+        'failed_contacts': <EmergencyContact>[],
+      };
+    }
 
+    final phoneNumbers = eligibleContacts.map((c) => c.phone).toList();
     try {
       final result = await ApiService.sendEmergencySms(
         phoneNumbers: phoneNumbers,
         message: message,
       );
 
-      if (result['success'] == true) {
-        return true;
+      final failedRaw = result['failed_numbers'] as List<dynamic>? ?? [];
+      final failedSet = failedRaw
+          .map((e) => e.toString().replaceAll(RegExp(r'\D'), ''))
+          .toSet();
+
+      List<EmergencyContact> failedContacts;
+      if (failedSet.isNotEmpty) {
+        failedContacts = eligibleContacts.where((c) {
+          final digits = c.phone.replaceAll(RegExp(r'\D'), '');
+          return failedSet.contains(digits) ||
+              failedSet.any((f) => digits.endsWith(f) || f.endsWith(digits));
+        }).toList();
+      } else if (result['success'] != true) {
+        failedContacts = eligibleContacts;
+      } else {
+        failedContacts = [];
       }
 
-      debugPrint(
-        'Backend SMS unavailable: ${result['error'] ?? result['message']}',
-      );
-      return false;
+      final int sentTo = result['sent_to'] as int? ??
+          (result['success'] == true
+              ? eligibleContacts.length - failedContacts.length
+              : 0);
+
+      return {
+        'success': result['success'] == true,
+        'partial': result['partial'] == true,
+        'backend': result['backend'],
+        'sent_to': sentTo,
+        'failed_contacts': failedContacts,
+        'message': result['message'] ?? result['error'],
+      };
     } catch (error) {
       debugPrint('Error sending SOS through backend: $error');
-      return false;
+      return {
+        'success': false,
+        'partial': false,
+        'backend': 'error',
+        'sent_to': 0,
+        'failed_contacts': eligibleContacts,
+        'error': error.toString(),
+      };
     }
+  }
+
+  Future<bool> sendSosViaBackend({
+    required List<EmergencyContact> contacts,
+    required String message,
+  }) async {
+    final detailed = await sendSosViaBackendDetailed(
+      contacts: contacts,
+      message: message,
+    );
+    return detailed['success'] == true &&
+        (detailed['failed_contacts'] as List).isEmpty;
   }
 
   Future<bool> shareSosToAllContacts({

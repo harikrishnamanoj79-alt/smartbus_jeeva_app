@@ -307,6 +307,14 @@ class BackendApiTest(unittest.TestCase):
         )
         self.assertEqual(valid_missed.status_code, 201)
 
+    def test_jwt_secret_not_hardcoded_and_persisted(self):
+        secret = backend.app.config.get("JWT_SECRET_KEY")
+        self.assertTrue(bool(secret))
+        # Ensure published hardcoded string is strictly absent
+        self.assertNotIn("smartbus-guardian-production-secret", secret)
+        self.assertNotIn("super-secret-smartbus", secret)
+        self.assertGreaterEqual(len(secret), 32)
+
 
 if __name__ == "__main__":
     unittest.main()

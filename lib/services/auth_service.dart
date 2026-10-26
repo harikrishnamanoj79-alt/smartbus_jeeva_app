@@ -9,8 +9,15 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'api_service.dart';
 
 class AuthService {
-  AuthService._();
+  AuthService._() {
+    ApiService.onUnauthorized = () {
+      _clearJwt();
+      sessionExpiredNotifier.value = true;
+    };
+  }
   static final AuthService instance = AuthService._();
+
+  final ValueNotifier<bool> sessionExpiredNotifier = ValueNotifier<bool>(false);
 
   static const _storageKey = 'smartbus_registered_users_v2';
   static const _sessionKey = 'smartbus_current_user_session_v2';

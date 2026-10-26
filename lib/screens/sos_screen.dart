@@ -520,14 +520,28 @@ class _SosScreenState extends State<SosScreen>
         userName: passengerName,
       );
 
-      final backendSent = await _emergencyService.sendSosViaBackend(
+      final smsResult = await _emergencyService.sendSosViaBackendDetailed(
         contacts: trustedContacts,
         message: message,
       );
 
-      if (backendSent) {
+      final failedContacts = List<EmergencyContact>.from(
+        smsResult['failed_contacts'] as List? ?? [],
+      );
+      final sentCount = smsResult['sent_to'] as int? ?? 0;
+
+      if (smsResult['success'] == true && failedContacts.isEmpty) {
         contactDeliveryMessage =
             'SOS SMS was sent through the backend to ${trustedContacts.length} trusted contact(s).';
+      } else if (sentCount > 0 && failedContacts.isNotEmpty) {
+        // Partial delivery: only fall back to device SMS for failed numbers
+        final composerOpened = await _emergencyService.shareSosToAllContacts(
+          contacts: failedContacts,
+          message: message,
+        );
+        contactDeliveryMessage = composerOpened
+            ? 'Backend sent SMS to $sentCount contact(s). Message ready for ${failedContacts.length} remaining contact(s) in your SMS app.'
+            : 'Backend sent SMS to $sentCount contact(s), but failed for ${failedContacts.length} contact(s).';
       } else {
         final composerOpened = await _emergencyService.shareSosToAllContacts(
           contacts: trustedContacts,
